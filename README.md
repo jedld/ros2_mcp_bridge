@@ -309,6 +309,12 @@ WantedBy=multi-user.target
 ```
 
 > Adjust `User`, `HOME`, and the workspace path if your setup differs.  Remove the `Wants`/`After` lines for `orin-cam-web` and `orin-detector` if you are not using those services.
+>
+> **Important:** if your ROS 2 setup uses a non-default `ROS_DOMAIN_ID` (e.g. set in `.bashrc`), add it explicitly to every service unit file under `[Service]`:
+> ```ini
+> Environment="ROS_DOMAIN_ID=42"
+> ```
+> Without this, systemd services default to domain 0 and their topics will be invisible to your terminal and to each other.
 
 ### Enable and start
 
@@ -503,6 +509,8 @@ Environment="PYTHONLOGLEVEL=DEBUG"
 | `navigate_to_pose` returns "not available" | Start the Nav2 stack: `ros2 launch nav2_bringup navigation_launch.py` |
 | Robot keeps moving | The deadman fires after 0.5 s — this is expected if commands are not being sent continuously |
 | Port already in use | Change `port` in `bridge.yaml` and update the agent's URL |
+| Topics visible when run manually but not from systemd service | `ROS_DOMAIN_ID` mismatch — add `Environment="ROS_DOMAIN_ID=<your-id>"` to every service unit, then `sudo systemctl daemon-reload && sudo systemctl restart <service>` |
+| `/detections` topic missing even though detector service is running | Same domain ID issue — see above |
 
 ---
 
