@@ -1,0 +1,52 @@
+# bridge.yaml — ros2_mcp_bridge configuration
+#
+# All settings are under the ros2_mcp_bridge key so this file can also be
+# loaded as a ROS 2 parameter file (ros2 param load ...).
+#
+# Override the config file path at runtime with:
+#   export ROS2_MCP_BRIDGE_CONFIG=/path/to/bridge.yaml
+
+ros2_mcp_bridge:
+
+  # ── MCP server ────────────────────────────────────────────────────────── #
+  transport: streamable-http   # FastMCP transport type (do not change)
+  host: 0.0.0.0                # Bind address; 0.0.0.0 = all interfaces
+  port: 18210                  # HTTP port the MCP server listens on
+  path: /ros2                  # URL path; onit connects to http://<ip>:18210/ros2
+
+  # ── Robot limits ─────────────────────────────────────────────────────── #
+  robot:
+    max_linear_speed: 0.22     # m/s  — TurtleBot3 Burger maximum
+    max_angular_speed: 2.84    # rad/s
+
+  # cmd_vel topic for motion commands
+  cmd_vel_topic: /cmd_vel
+
+  # Approximate image width used for steering heuristic in approach_object
+  image_width: 640
+
+  # ── Topic subscriptions ───────────────────────────────────────────────── #
+  # Each entry: {topic: <ros2 topic>, type: <pkg/MsgType>}
+  # Add or remove entries to match your robot's topic layout.
+  topics:
+
+    camera:
+      topic: /camera/image_raw/compressed
+      type: sensor_msgs/CompressedImage
+
+    laser:
+      topic: /scan
+      type: sensor_msgs/LaserScan
+
+    odom:
+      topic: /odom
+      type: nav_msgs/Odometry
+
+    detections:
+      topic: /detections
+      type: vision_msgs/Detection2DArray
+
+    # Uncomment to also subscribe to AMCL / map-frame pose
+    # amcl_pose:
+    #   topic: /amcl_pose
+    #   type: geometry_msgs/PoseWithCovarianceStamped

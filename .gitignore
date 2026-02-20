@@ -1,0 +1,67 @@
+# ── ROS 2 / colcon build artefacts ──────────────────────────────────────── #
+build/
+install/
+log/
+.colcon_install_layout
+
+# ── Python ───────────────────────────────────────────────────────────────── #
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+.eggs/
+.Python
+pip-wheel-metadata/
+*.whl
+
+# ── Virtual environments ─────────────────────────────────────────────────── #
+.venv/
+venv/
+env/
+ENV/
+
+# ── Testing & coverage ───────────────────────────────────────────────────── #
+.pytest_cache/
+.coverage
+htmlcov/
+*.coveragerc
+junit*.xml
+test-results/
+
+# ── Type checkers / linters ───────────────────────────────────────────────── #
+.mypy_cache/
+.ruff_cache/
+.pyright/
+
+# ── IDE / editor ─────────────────────────────────────────────────────────── #
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Machine-learning model files (large binaries) ────────────────────────── #
+*.engine
+*.onnx
+*.pt
+*.pth
+*.tflite
+
+# ── Secrets / environment ─────────────────────────────────────────────────── #
+.env
+.env.*
+*.pem
+*.key
+secrets.yaml
+
+# ── Logs and temporary files ─────────────────────────────────────────────── #
+*.log
+*.tmp
+*.bak
