@@ -281,30 +281,72 @@ ros2 launch ros2_mcp_bridge bridge.launch.py \
 
 ## Running as a systemd service
 
-Create `/etc/systemd/system/ros2_mcp_bridge.service`:
+### Service unit file
+
+Create `/etc/systemd/system/ros2-mcp-bridge.service`:
 
 ```ini
 [Unit]
-Description=ROS 2 MCP Bridge
-After=network.target
+Description=ROS 2 MCP Bridge (FastMCP tool server for robot control)
+Documentation=https://github.com/jedld/ros2_mcp_bridge
+After=network.target orin-cam-web.service orin-detector.service
+Wants=orin-cam-web.service orin-detector.service
 
 [Service]
-User=<your-user>
-Environment="HOME=/home/<your-user>"
+User=joseph
+Environment="HOME=/home/joseph"
 ExecStart=/bin/bash -c \
-  "source /home/<your-user>/your_ws/install/setup.bash && \
-   ros2 launch ros2_mcp_bridge bridge.launch.py"
+  "source /opt/ros/humble/setup.bash && \
+   source /home/joseph/turtlebot3_ws/install/setup.bash && \
+   ros2 run ros2_mcp_bridge bridge"
 Restart=on-failure
 RestartSec=5
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 ```
 
+> Adjust `User`, `HOME`, and the workspace path if your setup differs.  Remove the `Wants`/`After` lines for `orin-cam-web` and `orin-detector` if you are not using those services.
+
+### Enable and start
+
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now ros2_mcp_bridge
-sudo journalctl -fu ros2_mcp_bridge   # view logs
+sudo systemctl enable --now ros2-mcp-bridge
+```
+
+### Useful commands
+
+```bash
+# Live log stream (all output)
+sudo journalctl -fu ros2-mcp-bridge
+
+# Filter to MCP call/return lines only
+sudo journalctl -u ros2-mcp-bridge | grep "\[MCP"
+
+# Restart after a config or code change
+sudo systemctl restart ros2-mcp-bridge
+
+# Check current status
+sudo systemctl status ros2-mcp-bridge
+```
+
+### Full autostart stack
+
+When all three services are enabled the boot order is:
+
+```
+orin-cam-web   → publishes /camera/image_raw/compressed
+orin-detector  → subscribes to camera, publishes /detections
+ros2-mcp-bridge → subscribes to all sensor topics, serves MCP tools
+```
+
+Check everything at once:
+
+```bash
+sudo systemctl status orin-cam-web orin-detector ros2-mcp-bridge --no-pager
 ```
 
 ---
@@ -374,13 +416,13 @@ ros2 run ros2_mcp_bridge bridge 2>&1 | grep "\[MCP"
 
 ```bash
 # Stream live logs
-sudo journalctl -fu ros2_mcp_bridge
+sudo journalctl -fu ros2-mcp-bridge
 
 # Show only MCP call/return lines
-sudo journalctl -u ros2_mcp_bridge | grep "\[MCP"
+sudo journalctl -u ros2-mcp-bridge | grep "\[MCP"
 
 # Last 100 lines
-sudo journalctl -u ros2_mcp_bridge -n 100 --no-pager
+sudo journalctl -u ros2-mcp-bridge -n 100 --no-pager
 ```
 
 ### Debugging a specific invocation
