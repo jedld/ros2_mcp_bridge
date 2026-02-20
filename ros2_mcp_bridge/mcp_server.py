@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 from fastmcp import FastMCP
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
+from fastmcp.utilities.types import Image
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,6 @@ class LoggingMiddleware(Middleware):
 
 from ros2_mcp_bridge.ros_node import (
     ROS2BridgeNode,
-    compressed_image_to_dict,
     laser_scan_to_dict,
     odometry_to_dict,
     detections_to_dict,
@@ -122,21 +122,29 @@ def list_ros2_services() -> str:
     title="Get Camera Image",
     description=(
         "Capture the latest image from the robot's camera. "
-        "Returns a base64-encoded JPEG. "
+        "Returns an image that can be directly interpreted visually. "
         "Use this to visually inspect the robot's surroundings."
     ),
 )
-def get_camera_image(timeout: float = 3.0) -> str:
+def get_camera_image(timeout: float = 3.0) -> Image | str:
     """
     Args:
         timeout: Seconds to wait for a frame (default 3.0).
+
+    Returns:
+        Image: MCP ImageContent containing the JPEG frame (mimeType image/jpeg).
+        str:   JSON error string if no frame was available within the timeout.
     """
     cfg_topics = _node._cfg.get("topics", {})
     topic = cfg_topics.get("camera", {}).get("topic", "/camera/image_raw/compressed")
     msg = _node.get_latest(topic, timeout=timeout)
     if msg is None:
         return json.dumps({"error": f"No image received on {topic} within {timeout}s."})
-    return json.dumps(compressed_image_to_dict(msg))
+    # Return a proper MCP ImageContent so vision-language models receive the
+    # image data rather than a raw JSON blob.  FastMCP converts Image(data, format)
+    # → ImageContent(mimeType="image/jpeg", data=<base64>).
+    fmt = (msg.format or "jpeg").lower().split("/")[-1]  # normalise e.g. "jpeg" or "image/jpeg"
+    return Image(data=bytes(msg.data), format=fmt)
 
 
 @mcp.tool(
