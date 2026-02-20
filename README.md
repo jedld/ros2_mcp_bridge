@@ -337,6 +337,119 @@ bridge.py  ───────────────────────
 
 ---
 
+## Logging & Debugging
+
+### What gets logged
+
+The bridge logs every MCP tool call at `INFO` level via Python's standard `logging` module.  Each invocation produces two lines:
+
+```
+[INFO] ros2_mcp_bridge.mcp_server: [MCP CALL]   get_camera_image(timeout=3.0)
+[INFO] ros2_mcp_bridge.mcp_server: [MCP RETURN] get_camera_image → OK in 0.182s
+
+[INFO] ros2_mcp_bridge.mcp_server: [MCP CALL]   move_robot(linear_x=0.1, angular_z=0.0, duration=2.0)
+[INFO] ros2_mcp_bridge.mcp_server: [MCP RETURN] move_robot → OK in 2.011s
+
+[INFO] ros2_mcp_bridge.mcp_server: [MCP CALL]   stop_robot()
+[INFO] ros2_mcp_bridge.mcp_server: [MCP ERROR]  stop_robot raised <exception> in 0.002s
+```
+
+### Viewing logs — foreground process
+
+When you start the bridge directly in a terminal the log lines are written to stdout:
+
+```bash
+ros2 run ros2_mcp_bridge bridge
+# — or —
+ros2 launch ros2_mcp_bridge bridge.launch.py
+```
+
+Filter to only MCP call lines:
+
+```bash
+ros2 run ros2_mcp_bridge bridge 2>&1 | grep "\[MCP"
+```
+
+### Viewing logs — systemd service
+
+```bash
+# Stream live logs
+sudo journalctl -fu ros2_mcp_bridge
+
+# Show only MCP call/return lines
+sudo journalctl -u ros2_mcp_bridge | grep "\[MCP"
+
+# Last 100 lines
+sudo journalctl -u ros2_mcp_bridge -n 100 --no-pager
+```
+
+### Debugging a specific invocation
+
+1. **Watch calls in real time** — in one terminal, tail the logs; in another, trigger the agent or call the tool manually:
+
+   ```bash
+   # Terminal 1: watch the bridge
+   sudo journalctl -fu ros2_mcp_bridge | grep "\[MCP"
+
+   # Terminal 2: manually call a tool to verify it round-trips correctly
+   python3.10 - <<'EOF'
+   import asyncio
+   from fastmcp import Client
+
+   async def main():
+       async with Client("http://localhost:18210/ros2") as c:
+           result = await c.call_tool("get_camera_image", {"timeout": 3.0})
+           print(result[0].text[:200])   # preview first 200 chars of JSON
+
+   asyncio.run(main())
+   EOF
+   ```
+
+2. **Check which tools an agent is discovering** — list the registered tools from the CLI:
+
+   ```bash
+   python3.10 - <<'EOF'
+   import asyncio
+   from fastmcp import Client
+
+   async def main():
+       async with Client("http://localhost:18210/ros2") as c:
+           tools = await c.list_tools()
+           for t in tools:
+               print(t.name, "—", t.description[:60])
+
+   asyncio.run(main())
+   EOF
+   ```
+
+3. **Inspect raw request/response** — run the bridge with Python logging at `DEBUG` to see the full MCP JSON frames:
+
+   ```bash
+   PYTHONPATH=. python3.10 -c "
+   import logging
+   logging.basicConfig(level=logging.DEBUG)
+   from ros2_mcp_bridge import bridge
+   bridge.main()
+   "
+   ```
+
+### Adjusting log verbosity
+
+Log level is set in `bridge.py` via `logging.basicConfig(level=logging.INFO)`.  To change it without rebuilding, set `PYTHONLOGLEVEL` or pass an env var to the service:
+
+```bash
+# Temporarily more verbose
+ROS_LOG_LEVEL=debug ros2 run ros2_mcp_bridge bridge
+```
+
+Or edit the `[Service]` section of the systemd unit to add:
+
+```ini
+Environment="PYTHONLOGLEVEL=DEBUG"
+```
+
+---
+
 ## Troubleshooting
 
 | Problem | Solution |

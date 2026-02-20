@@ -9,11 +9,46 @@ that the agent can discover and call all tools automatically.
 import asyncio
 import base64
 import json
+import logging
 import math
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from fastmcp import FastMCP
+from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
+
+logger = logging.getLogger(__name__)
+
+
+class LoggingMiddleware(Middleware):
+    """Logs every tool call with name, arguments, duration, and error status."""
+
+    async def on_call_tool(
+        self,
+        context: MiddlewareContext,
+        call_next: CallNext,
+    ) -> Any:
+        params = context.message
+        tool_name = getattr(params, "name", "<unknown>")
+        arguments = getattr(params, "arguments", {})
+        args_str = ", ".join(f"{k}={v!r}" for k, v in (arguments or {}).items())
+        logger.info("[MCP CALL] %s(%s)", tool_name, args_str)
+        t0 = time.monotonic()
+        try:
+            result = await call_next(context)
+            elapsed = time.monotonic() - t0
+            is_error = getattr(result, "isError", False)
+            logger.info(
+                "[MCP RETURN] %s → %s in %.3fs",
+                tool_name,
+                "ERROR" if is_error else "OK",
+                elapsed,
+            )
+            return result
+        except Exception as exc:  # noqa: BLE001
+            elapsed = time.monotonic() - t0
+            logger.error("[MCP ERROR] %s raised %s in %.3fs", tool_name, exc, elapsed)
+            raise
 
 from ros2_mcp_bridge.ros_node import (
     ROS2BridgeNode,
@@ -44,6 +79,7 @@ mcp = FastMCP(
         "Provides access to camera, laser scan, odometry, object detections, "
         "velocity commands, and Nav2 navigation."
     ),
+    middleware=[LoggingMiddleware()],
 )
 
 
