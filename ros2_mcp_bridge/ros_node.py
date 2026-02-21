@@ -157,6 +157,69 @@ class ROS2BridgeNode(Node):
         with self._cmd_lock:
             self._last_cmd_time = 0.0
 
+    def check_collision(self, linear_x: float) -> dict:
+        """
+        Read the latest LiDAR scan and check whether *linear_x* motion would
+        drive the robot toward a nearby obstacle.
+
+        Returns a dict::
+
+            {
+                "blocked":     bool,          # True → suppress motion
+                "distance_m":  float | None,  # measured obstacle distance
+                "sector":      str | None,    # "front" | "rear"
+                "message":     str,           # human/LLM-readable explanation
+            }
+
+        If no LiDAR data is available the call returns ``blocked=False`` so
+        that the robot can still move (fail-open; caller should log the
+        "message" field).
+        """
+        ca_cfg = self._cfg.get("collision_avoidance", {})
+        min_front = float(ca_cfg.get("min_front_distance", 0.30))
+        min_rear  = float(ca_cfg.get("min_rear_distance",  0.20))
+
+        cfg_topics = self._cfg.get("topics", {})
+        laser_topic = cfg_topics.get("laser", {}).get("topic", "/scan")
+        scan_msg = self.get_latest(laser_topic, timeout=0.5)
+
+        if scan_msg is None:
+            return {
+                "blocked": False,
+                "distance_m": None,
+                "sector": None,
+                "message": "LiDAR not available; collision avoidance skipped.",
+            }
+
+        scan = laser_scan_to_dict(scan_msg)
+
+        if linear_x > 0.0:
+            dist = scan.get("front_min_m")
+            if dist is not None and dist < min_front:
+                return {
+                    "blocked": True,
+                    "distance_m": round(dist, 3),
+                    "sector": "front",
+                    "message": (
+                        f"Collision avoidance activated: obstacle {dist:.2f} m ahead "
+                        f"(threshold {min_front:.2f} m). Forward motion suppressed."
+                    ),
+                }
+        elif linear_x < 0.0:
+            dist = scan.get("rear_min_m")
+            if dist is not None and dist < min_rear:
+                return {
+                    "blocked": True,
+                    "distance_m": round(dist, 3),
+                    "sector": "rear",
+                    "message": (
+                        f"Collision avoidance activated: obstacle {dist:.2f} m behind "
+                        f"(threshold {min_rear:.2f} m). Backward motion suppressed."
+                    ),
+                }
+
+        return {"blocked": False, "distance_m": None, "sector": None, "message": ""}
+
     def list_topics(self) -> List[Tuple[str, List[str]]]:
         """Return the current topic list from the ROS graph."""
         return self.get_topic_names_and_types()

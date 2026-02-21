@@ -25,6 +25,15 @@ ros2_mcp_bridge:
   # Approximate image width used for steering heuristic in approach_object
   image_width: 640
 
+  # ── Collision avoidance ───────────────────────────────────────────────── #
+  # LiDAR-based collision avoidance applied to all linear motion commands.
+  # Each movement tool also exposes a per-call `collision_avoidance` parameter
+  # that can override this global switch.
+  collision_avoidance:
+    enabled: true             # Master switch; set to false to disable globally
+    min_front_distance: 0.30  # m — suppress forward motion if obstacle closer
+    min_rear_distance:  0.20  # m — suppress backward motion if obstacle closer
+
   # ── Topic subscriptions ───────────────────────────────────────────────── #
   # Each entry: {topic: <ros2 topic>, type: <pkg/MsgType>}
   # Add or remove entries to match your robot's topic layout.
