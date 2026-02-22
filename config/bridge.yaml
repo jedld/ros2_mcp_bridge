@@ -55,6 +55,19 @@ ros2_mcp_bridge:
       topic: /detections
       type: vision_msgs/Detection2DArray
 
+    # Battery state (sensor_msgs/BatteryState) — available on both stock
+    # TurtleBot3 and Pico variants.  Tools degrade gracefully if absent.
+    battery:
+      topic: /battery_state
+      type: sensor_msgs/BatteryState
+
+    # TurtleBot3-specific sensor state (encoder counts, torque, bumper).
+    # Requires turtlebot3_msgs to be installed.  The MCP tool returns an
+    # error if the topic never publishes — safe to leave enabled.
+    sensor_state:
+      topic: /sensor_state
+      type: turtlebot3_msgs/SensorState
+
     # Uncomment to also subscribe to AMCL / map-frame pose
     # amcl_pose:
     #   topic: /amcl_pose

@@ -24,7 +24,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy
 
 from geometry_msgs.msg import Twist
-from sensor_msgs.msg import CompressedImage, LaserScan
+from sensor_msgs.msg import CompressedImage, LaserScan, BatteryState
 from nav_msgs.msg import Odometry
 from vision_msgs.msg import Detection2DArray
 
@@ -43,6 +43,13 @@ class ROS2BridgeNode(Node):
         super().__init__("ros2_mcp_bridge")
         self._cfg = config
         self._cb = ReentrantCallbackGroup()
+
+        # ------------------------------------------------------------------ #
+        # Robot limits from config (used by publish_twist clipping)
+        # ------------------------------------------------------------------ #
+        robot_cfg = config.get("robot", {})
+        self._max_linear_speed = float(robot_cfg.get("max_linear_speed", 0.22))
+        self._max_angular_speed = float(robot_cfg.get("max_angular_speed", 2.84))
 
         # ------------------------------------------------------------------ #
         # Per-topic cache: {topic_name: {"msg": <msg>, "event": Event}}
@@ -145,8 +152,10 @@ class ROS2BridgeNode(Node):
     def publish_twist(self, linear_x: float, angular_z: float):
         """Publish a Twist to cmd_vel and reset the deadman timer."""
         t = Twist()
-        t.linear.x = float(np.clip(linear_x, -0.22, 0.22))
-        t.angular.z = float(np.clip(angular_z, -2.84, 2.84))
+        t.linear.x = float(np.clip(linear_x, -self._max_linear_speed,
+                                    self._max_linear_speed))
+        t.angular.z = float(np.clip(angular_z, -self._max_angular_speed,
+                                     self._max_angular_speed))
         self._cmd_pub.publish(t)
         with self._cmd_lock:
             self._last_cmd_time = time.time()
@@ -228,6 +237,25 @@ class ROS2BridgeNode(Node):
         """Return the current service list from the ROS graph."""
         return self.get_service_names_and_types()
 
+    def reset_odometry(self, timeout: float = 5.0) -> dict:
+        """Call the /reset_odometry service to zero the odometry pose."""
+        from std_srvs.srv import Trigger
+        client = self.create_client(Trigger, "/reset_odometry")
+        if not client.wait_for_service(timeout_sec=timeout):
+            return {"status": "failed",
+                    "message": "/reset_odometry service not available."}
+        req = Trigger.Request()
+        future = client.call_async(req)
+        # Block until result (safe — called from MCP thread, not rclpy executor)
+        deadline = time.time() + timeout
+        while not future.done() and time.time() < deadline:
+            time.sleep(0.05)
+        if not future.done():
+            return {"status": "failed", "message": "Service call timed out."}
+        result = future.result()
+        return {"status": "succeeded" if result.success else "failed",
+                "message": result.message}
+
     # ------------------------------------------------------------------ #
     # Nav2 action client (lazy)
     # ------------------------------------------------------------------ #
@@ -296,6 +324,7 @@ class ROS2BridgeNode(Node):
 _MSG_TYPE_MAP = {
     "sensor_msgs/CompressedImage":   CompressedImage,
     "sensor_msgs/LaserScan":         LaserScan,
+    "sensor_msgs/BatteryState":      BatteryState,
     "nav_msgs/Odometry":             Odometry,
     "vision_msgs/Detection2DArray":  Detection2DArray,
 }
@@ -397,3 +426,23 @@ def detections_to_dict(msg: Detection2DArray) -> dict:
             },
         })
     return {"count": len(items), "detections": items}
+
+
+def sensor_state_to_dict(msg) -> dict:
+    """Serialise turtlebot3_msgs/SensorState to a plain dict."""
+    return {
+        "battery_voltage": round(msg.battery, 3),
+        "torque_enabled": bool(msg.torque),
+        "left_encoder": msg.left_encoder,
+        "right_encoder": msg.right_encoder,
+        "bumper": msg.bumper,
+    }
+
+
+def battery_state_to_dict(msg) -> dict:
+    """Serialise sensor_msgs/BatteryState to a plain dict."""
+    return {
+        "voltage": round(msg.voltage, 3),
+        "percentage": round(msg.percentage, 2) if not math.isnan(msg.percentage) else None,
+        "present": bool(msg.present),
+    }

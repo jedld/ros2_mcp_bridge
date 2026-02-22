@@ -56,6 +56,8 @@ from ros2_mcp_bridge.ros_node import (
     laser_scan_to_dict,
     odometry_to_dict,
     detections_to_dict,
+    sensor_state_to_dict,
+    battery_state_to_dict,
 )
 
 # Singleton reference injected by bridge.py before the server starts
@@ -77,7 +79,8 @@ mcp = FastMCP(
     instructions=(
         "Tools for controlling a TurtleBot3 robot via ROS 2. "
         "Provides access to camera, laser scan, odometry, object detections, "
-        "velocity commands, and Nav2 navigation."
+        "battery/sensor state, velocity commands, and Nav2 navigation. "
+        "Works with both stock TurtleBot3 (OpenCR) and Pico-based variants."
     ),
     middleware=[LoggingMiddleware()],
 )
@@ -235,8 +238,10 @@ def move_robot(
 ) -> str:
     """
     Args:
-        linear_x: Forward velocity in m/s. Range [-0.22, 0.22] (TurtleBot3 Burger).
-        angular_z: Rotational velocity in rad/s. Range [-2.84, 2.84].
+        linear_x: Forward velocity in m/s. Clamped to the configured
+                  robot.max_linear_speed (default 0.22).
+        angular_z: Rotational velocity in rad/s. Clamped to the configured
+                   robot.max_angular_speed (default 2.84).
         collision_avoidance: If True (default), check LiDAR before moving and
                              suppress the command if an obstacle is too close.
                              Set to False to override (use with caution).
@@ -272,6 +277,65 @@ def stop_robot() -> str:
     """Stop all robot motion."""
     _node.stop()
     return json.dumps({"status": "stopped"})
+
+
+@mcp.tool(
+    title="Get Battery State",
+    description=(
+        "Return the robot's current battery voltage and charge percentage. "
+        "Uses sensor_msgs/BatteryState if available."
+    ),
+)
+def get_battery_state(timeout: float = 2.0) -> str:
+    """
+    Args:
+        timeout: Seconds to wait for a battery message (default 2.0).
+    """
+    cfg_topics = _node._cfg.get("topics", {})
+    topic = cfg_topics.get("battery", {}).get("topic", "/battery_state")
+    msg = _node.get_latest(topic, timeout=timeout)
+    if msg is None:
+        return json.dumps({"error": f"No battery data received on {topic} within {timeout}s."})
+    return json.dumps(battery_state_to_dict(msg))
+
+
+@mcp.tool(
+    title="Get Sensor State",
+    description=(
+        "Return the robot's low-level sensor state including encoder counts, "
+        "torque status, bumper, and battery voltage. "
+        "This is a TurtleBot3-specific topic; returns an error if not available."
+    ),
+)
+def get_sensor_state(timeout: float = 2.0) -> str:
+    """
+    Args:
+        timeout: Seconds to wait for a sensor_state message (default 2.0).
+    """
+    cfg_topics = _node._cfg.get("topics", {})
+    topic = cfg_topics.get("sensor_state", {}).get("topic", "/sensor_state")
+    msg = _node.get_latest(topic, timeout=timeout)
+    if msg is None:
+        return json.dumps({"error": f"No sensor state received on {topic} within {timeout}s. "
+                           "This topic requires turtlebot3_node to be running."})
+    return json.dumps(sensor_state_to_dict(msg))
+
+
+@mcp.tool(
+    title="Reset Odometry",
+    description=(
+        "Reset the robot's odometry to zero. Useful before executing "
+        "a precise movement sequence. Calls the /reset_odometry service "
+        "provided by turtlebot3_node."
+    ),
+)
+def reset_odometry(timeout: float = 5.0) -> str:
+    """
+    Args:
+        timeout: Seconds to wait for the service (default 5.0).
+    """
+    result = _node.reset_odometry(timeout)
+    return json.dumps(result)
 
 
 @mcp.tool(
