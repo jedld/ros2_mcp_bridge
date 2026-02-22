@@ -226,8 +226,9 @@ def get_detections(timeout: float = 2.0) -> str:
         "Drive the robot by publishing a velocity command. "
         "Positive linear_x moves forward; positive angular_z turns left "
         "(counter-clockwise). "
-        "The command is sent once; the robot will stop automatically after "
-        "~0.5 s unless you keep calling this tool. "
+        "Use the duration parameter to keep the robot moving for a set time "
+        "(default 0.5 s). The robot stops automatically when the duration "
+        "expires. "
         "When collision_avoidance is enabled (default) and LiDAR detects an "
         "obstacle in the direction of linear motion, the command is suppressed "
         "and collision_avoidance_activated will be true in the response."
@@ -236,6 +237,7 @@ def get_detections(timeout: float = 2.0) -> str:
 def move_robot(
     linear_x: float = 0.0,
     angular_z: float = 0.0,
+    duration: float = 0.5,
     collision_avoidance: bool = True,
 ) -> str:
     """
@@ -244,10 +246,14 @@ def move_robot(
                   robot.max_linear_speed (default 0.22).
         angular_z: Rotational velocity in rad/s. Clamped to the configured
                    robot.max_angular_speed (default 2.84).
+        duration: How long to drive for, in seconds (default 0.5, max 10).
+                  The robot is stopped automatically once this time elapses.
         collision_avoidance: If True (default), check LiDAR before moving and
                              suppress the command if an obstacle is too close.
                              Set to False to override (use with caution).
     """
+    duration = max(0.1, min(float(duration), 10.0))  # clamp 0.1–10 s
+
     ca_global = _node._cfg.get("collision_avoidance", {}).get("enabled", True)
 
     if collision_avoidance and ca_global and linear_x != 0.0:
@@ -262,11 +268,12 @@ def move_robot(
                 "sector": ca_result["sector"],
             })
 
-    _node.publish_twist(linear_x, angular_z)
+    _node.publish_twist_for_duration(linear_x, angular_z, duration)
     return json.dumps({
         "status": "ok",
         "linear_x": linear_x,
         "angular_z": angular_z,
+        "duration": duration,
         "collision_avoidance_activated": False,
     })
 

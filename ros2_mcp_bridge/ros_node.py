@@ -160,6 +160,23 @@ class ROS2BridgeNode(Node):
         with self._cmd_lock:
             self._last_cmd_time = time.time()
 
+    def publish_twist_for_duration(
+        self, linear_x: float, angular_z: float, duration: float,
+        rate_hz: float = 10.0,
+    ):
+        """
+        Publish Twist at *rate_hz* for *duration* seconds, then stop.
+
+        This keeps the deadman alive for the whole interval so the robot
+        actually moves for the requested time.
+        """
+        period = 1.0 / rate_hz
+        end_time = time.time() + duration
+        while time.time() < end_time:
+            self.publish_twist(linear_x, angular_z)
+            time.sleep(period)
+        self.stop()
+
     def stop(self):
         """Immediately publish a zero-velocity Twist."""
         self._cmd_pub.publish(Twist())
