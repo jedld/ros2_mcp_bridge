@@ -18,6 +18,11 @@ ros2_mcp_bridge:
   robot:
     max_linear_speed: 0.22     # m/s  — TurtleBot3 Burger maximum
     max_angular_speed: 2.84    # rad/s
+    # Wheel-radius calibration scale factor.  If move_distance consistently
+    # over/under-shoots, run calibrate_motion, measure with a tape measure,
+    # and set: scale = odometry_reported / actual_measured.
+    # 1.0 = trust odometry as-is.  > 1.0 = odom over-reports distance.
+    wheel_radius_scale: 1.0
 
   # cmd_vel topic for motion commands
   cmd_vel_topic: /cmd_vel

@@ -51,6 +51,13 @@ class ROS2BridgeNode(Node):
         self._max_linear_speed = float(robot_cfg.get("max_linear_speed", 0.22))
         self._max_angular_speed = float(robot_cfg.get("max_angular_speed", 2.84))
 
+        # Wheel-radius calibration scale factor (1.0 = trust odometry as-is).
+        # If the robot consistently over/under-shoots, adjust this value.
+        # scale > 1.0 means odometry reports more distance than actual.
+        self._wheel_radius_scale = float(
+            robot_cfg.get("wheel_radius_scale", 1.0)
+        )
+
         # ------------------------------------------------------------------ #
         # Per-topic cache: {topic_name: {"msg": <msg>, "event": Event}}
         # ------------------------------------------------------------------ #
@@ -182,6 +189,233 @@ class ROS2BridgeNode(Node):
         self._cmd_pub.publish(Twist())
         with self._cmd_lock:
             self._last_cmd_time = 0.0
+
+    # ------------------------------------------------------------------ #
+    # Odometry helpers
+    # ------------------------------------------------------------------ #
+
+    def _get_odom_pose(self) -> Optional[Tuple[float, float, float]]:
+        """Return (x, y, yaw) from latest odometry, or None."""
+        cfg_topics = self._cfg.get("topics", {})
+        odom_topic = cfg_topics.get("odom", {}).get("topic", "/odom")
+        msg = self.get_latest(odom_topic, timeout=1.0)
+        if msg is None:
+            return None
+        p = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+        return (p.x, p.y, yaw)
+
+    # ------------------------------------------------------------------ #
+    # Closed-loop distance / rotation
+    # ------------------------------------------------------------------ #
+
+    def move_distance(
+        self,
+        distance_m: float,
+        speed: float = 0.0,
+        timeout: float = 30.0,
+        collision_avoidance: bool = True,
+    ) -> dict:
+        """
+        Drive *distance_m* metres using odometry feedback.  Positive = forward.
+        *speed* is the cruise velocity (m/s); 0 = use 80% of max.
+        Returns a dict with status, distance_requested, distance_actual.
+        """
+        if speed <= 0:
+            speed = self._max_linear_speed * 0.8
+        speed = min(speed, self._max_linear_speed)
+        scale = self._wheel_radius_scale
+
+        start = self._get_odom_pose()
+        if start is None:
+            return {"status": "failed",
+                    "message": "Odometry not available."}
+
+        # Check collision before starting
+        direction = 1.0 if distance_m >= 0 else -1.0
+        if collision_avoidance:
+            ca_result = self.check_collision(direction * speed)
+            if ca_result["blocked"]:
+                self.stop()
+                return {
+                    "status": "blocked",
+                    "collision_avoidance_activated": True,
+                    "message": ca_result["message"],
+                    "obstacle_distance_m": ca_result["distance_m"],
+                    "distance_requested": round(distance_m, 4),
+                    "distance_actual": 0.0,
+                }
+
+        target = abs(distance_m)
+        rate_hz = 20.0
+        period = 1.0 / rate_hz
+        deadline = time.time() + timeout
+        travelled = 0.0
+        prev = start
+
+        while travelled < target and time.time() < deadline:
+            # Proportional slow-down in the last 0.05 m
+            remaining = target - travelled
+            cmd_speed = speed if remaining > 0.05 else max(0.05, speed * (remaining / 0.05))
+            self.publish_twist(direction * cmd_speed, 0.0)
+            time.sleep(period)
+
+            cur = self._get_odom_pose()
+            if cur is None:
+                continue
+            dx = cur[0] - prev[0]
+            dy = cur[1] - prev[1]
+            step = math.sqrt(dx * dx + dy * dy) / scale
+            travelled += step
+            prev = cur
+
+            # Periodic collision check
+            if collision_avoidance and int(travelled * 100) % 10 == 0:
+                ca_result = self.check_collision(direction * cmd_speed)
+                if ca_result["blocked"]:
+                    self.stop()
+                    return {
+                        "status": "blocked",
+                        "collision_avoidance_activated": True,
+                        "message": ca_result["message"],
+                        "distance_requested": round(distance_m, 4),
+                        "distance_actual": round(direction * travelled, 4),
+                    }
+
+        self.stop()
+
+        timed_out = travelled < target * 0.9
+        return {
+            "status": "timeout" if timed_out else "succeeded",
+            "distance_requested": round(distance_m, 4),
+            "distance_actual": round(direction * travelled, 4),
+            "message": ("Timed out before reaching target distance."
+                        if timed_out else "Distance reached."),
+        }
+
+    def rotate_angle(
+        self,
+        angle_deg: float,
+        speed: float = 0.0,
+        timeout: float = 20.0,
+    ) -> dict:
+        """
+        Rotate *angle_deg* degrees using odometry feedback.
+        Positive = counter-clockwise (left).  Negative = clockwise (right).
+        *speed* is angular velocity (rad/s); 0 = use 50% of max.
+        Returns dict with status, angle_requested, angle_actual.
+        """
+        if speed <= 0:
+            speed = self._max_angular_speed * 0.5
+        speed = min(speed, self._max_angular_speed)
+
+        start = self._get_odom_pose()
+        if start is None:
+            return {"status": "failed",
+                    "message": "Odometry not available."}
+
+        target_rad = abs(math.radians(angle_deg))
+        direction = 1.0 if angle_deg >= 0 else -1.0
+        rate_hz = 20.0
+        period = 1.0 / rate_hz
+        deadline = time.time() + timeout
+        rotated = 0.0
+        prev_yaw = start[2]
+
+        while rotated < target_rad and time.time() < deadline:
+            remaining = target_rad - rotated
+            # Slow down in the last 10 degrees
+            if remaining < math.radians(10):
+                cmd_speed = max(0.15, speed * (remaining / math.radians(10)))
+            else:
+                cmd_speed = speed
+            self.publish_twist(0.0, direction * cmd_speed)
+            time.sleep(period)
+
+            cur = self._get_odom_pose()
+            if cur is None:
+                continue
+            # Signed angular delta, taking wraparound into account
+            d_yaw = cur[2] - prev_yaw
+            if d_yaw > math.pi:
+                d_yaw -= 2 * math.pi
+            elif d_yaw < -math.pi:
+                d_yaw += 2 * math.pi
+            rotated += abs(d_yaw)
+            prev_yaw = cur[2]
+
+        self.stop()
+
+        timed_out = rotated < target_rad * 0.9
+        actual_deg = math.degrees(rotated) * direction
+        return {
+            "status": "timeout" if timed_out else "succeeded",
+            "angle_requested_deg": round(angle_deg, 2),
+            "angle_actual_deg": round(actual_deg, 2),
+            "message": ("Timed out before reaching target angle."
+                        if timed_out else "Rotation complete."),
+        }
+
+    def calibrate_motion(self, distance_m: float = 1.0, speed: float = 0.0,
+                         timeout: float = 30.0) -> dict:
+        """
+        Drive *distance_m* according to odometry (ignoring scale), stop, and
+        return the odom-reported distance.  The user measures actual distance
+        and computes: new_scale = odom_reported / actual_measured.
+        """
+        if speed <= 0:
+            speed = self._max_linear_speed * 0.8
+        speed = min(speed, self._max_linear_speed)
+
+        start = self._get_odom_pose()
+        if start is None:
+            return {"status": "failed",
+                    "message": "Odometry not available."}
+
+        # Drive using raw odometry (scale = 1.0)
+        target = abs(distance_m)
+        direction = 1.0 if distance_m >= 0 else -1.0
+        rate_hz = 20.0
+        period = 1.0 / rate_hz
+        deadline = time.time() + timeout
+        travelled = 0.0
+        prev = start
+
+        while travelled < target and time.time() < deadline:
+            remaining = target - travelled
+            cmd_speed = speed if remaining > 0.05 else max(0.05, speed * (remaining / 0.05))
+            self.publish_twist(direction * cmd_speed, 0.0)
+            time.sleep(period)
+
+            cur = self._get_odom_pose()
+            if cur is None:
+                continue
+            dx = cur[0] - prev[0]
+            dy = cur[1] - prev[1]
+            step = math.sqrt(dx * dx + dy * dy)
+            travelled += step
+            prev = cur
+
+        self.stop()
+        return {
+            "status": "succeeded",
+            "distance_requested_m": round(distance_m, 4),
+            "odometry_reported_m": round(direction * travelled, 4),
+            "current_wheel_radius_scale": self._wheel_radius_scale,
+            "instructions": (
+                "Measure the actual distance the robot moved with a tape measure. "
+                "Then compute: new_scale = odometry_reported_m / actual_measured_m. "
+                "Set robot.wheel_radius_scale in bridge.yaml to this value. "
+                "For example, if odometry reported 1.0 m but the robot only moved "
+                "0.85 m, set wheel_radius_scale to 1.176 (= 1.0 / 0.85). "
+                "Alternatively, adjust wheel_radius in the ROS 2 param file "
+                "(burger.yaml or burger_pico.yaml): "
+                "new_radius = current_radius * (actual / odometry_reported)."
+            ),
+        }
 
     def check_collision(self, linear_x: float) -> dict:
         """

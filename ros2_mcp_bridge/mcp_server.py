@@ -223,15 +223,14 @@ def get_detections(timeout: float = 2.0) -> str:
 @mcp.tool(
     title="Move Robot",
     description=(
-        "Drive the robot by publishing a velocity command. "
-        "Positive linear_x moves forward; positive angular_z turns left "
-        "(counter-clockwise). "
-        "Use the duration parameter to keep the robot moving for a set time "
-        "(default 0.5 s). The robot stops automatically when the duration "
-        "expires. "
+        "Low-level velocity command — publishes a velocity for a set duration. "
+        "Positive linear_x moves forward; positive angular_z turns left. "
+        "WARNING: This is open-loop (time-based), NOT distance-based. "
+        "To move an exact distance (e.g. 1 metre), use move_distance instead. "
+        "To rotate an exact angle, use rotate_angle instead. "
+        "Default duration is only 0.5 s at max 0.22 m/s = ~0.11 m. "
         "When collision_avoidance is enabled (default) and LiDAR detects an "
-        "obstacle in the direction of linear motion, the command is suppressed "
-        "and collision_avoidance_activated will be true in the response."
+        "obstacle, the command is suppressed."
     ),
 )
 def move_robot(
@@ -286,6 +285,97 @@ def stop_robot() -> str:
     """Stop all robot motion."""
     _node.stop()
     return json.dumps({"status": "stopped"})
+
+
+@mcp.tool(
+    title="Move Distance",
+    description=(
+        "Drive the robot a precise distance in metres using closed-loop "
+        "odometry feedback. Positive distance = forward, negative = backward. "
+        "The robot accelerates, maintains cruise speed, and decelerates to "
+        "stop at the target. Much more accurate than move_robot for "
+        "specific distances. Collision avoidance is checked before and "
+        "during motion. Works on both stock TurtleBot3 and Pico variant. "
+        "If the robot consistently over-shoots or under-shoots, run "
+        "calibrate_motion and update wheel_radius_scale in bridge.yaml."
+    ),
+)
+def move_distance(
+    distance: float,
+    speed: float = 0.0,
+    timeout: float = 30.0,
+    collision_avoidance: bool = True,
+) -> str:
+    """
+    Args:
+        distance: Distance to travel in metres. Positive = forward,
+                  negative = backward.
+        speed: Cruise speed in m/s (default 0 = 80% of max_linear_speed).
+        timeout: Maximum seconds to spend driving (default 30).
+        collision_avoidance: If True (default), check LiDAR before and
+                             during motion.
+    """
+    ca_global = _node._cfg.get("collision_avoidance", {}).get("enabled", True)
+    effective_ca = collision_avoidance and ca_global
+    result = _node.move_distance(distance, speed, timeout, effective_ca)
+    return json.dumps(result)
+
+
+@mcp.tool(
+    title="Rotate Angle",
+    description=(
+        "Rotate the robot a precise angle in degrees using closed-loop "
+        "odometry feedback. Positive angle = counter-clockwise (left), "
+        "negative = clockwise (right). The robot decelerates as it "
+        "approaches the target heading. Much more accurate than using "
+        "move_robot with angular_z for precise turns. "
+        "Works on both stock TurtleBot3 and Pico variant."
+    ),
+)
+def rotate_angle(
+    angle: float,
+    speed: float = 0.0,
+    timeout: float = 20.0,
+) -> str:
+    """
+    Args:
+        angle: Angle to rotate in degrees. Positive = counter-clockwise (left),
+               negative = clockwise (right).
+        speed: Angular speed in rad/s (default 0 = 50% of max_angular_speed).
+        timeout: Maximum seconds to spend rotating (default 20).
+    """
+    result = _node.rotate_angle(angle, speed, timeout)
+    return json.dumps(result)
+
+
+@mcp.tool(
+    title="Calibrate Motion",
+    description=(
+        "Calibration helper: drives the robot a specified distance according "
+        "to odometry, then stops and reports the odometry-measured distance. "
+        "The user should measure the actual distance traveled with a tape "
+        "measure, then compute: wheel_radius_scale = odometry_reported / actual. "
+        "Set this value in bridge.yaml under robot.wheel_radius_scale to "
+        "correct future move_distance calls. Alternatively, adjust the "
+        "wheel_radius parameter in the ROS 2 param file (burger.yaml or "
+        "burger_pico.yaml) using: new_radius = current × (actual / odom). "
+        "This works for both stock TurtleBot3 and Pico variants."
+    ),
+)
+def calibrate_motion(
+    distance: float = 1.0,
+    speed: float = 0.0,
+    timeout: float = 30.0,
+) -> str:
+    """
+    Args:
+        distance: Distance to drive in metres (default 1.0). Use a value
+                  long enough to measure accurately (0.5-2.0 m recommended).
+        speed: Cruise speed in m/s (default 0 = 80% of max speed).
+        timeout: Maximum seconds (default 30).
+    """
+    result = _node.calibrate_motion(distance, speed, timeout)
+    return json.dumps(result)
 
 
 @mcp.tool(
