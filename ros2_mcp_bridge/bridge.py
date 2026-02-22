@@ -17,12 +17,17 @@ import logging
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
 
 logger = logging.getLogger(__name__)
+
+# Minimum epoch (2024-01-01) before which we consider the system clock unsync'd.
+# Jetson Orin has no RTC battery and boots at epoch until NTP corrects it.
+_MIN_EPOCH = 1_704_067_200  # 2024-01-01 00:00:00 UTC
 
 # --------------------------------------------------------------------------- #
 # Config loading
@@ -106,6 +111,15 @@ def main(args=None):
     cfg = _load_config(cfg_path)
 
     bridge_cfg = cfg.get("ros2_mcp_bridge", cfg)  # tolerate flat or nested YAML
+
+    # -- Wait for sane system clock ------------------------------------------ #
+    # Jetson Orin boots at epoch (no RTC battery); DDS participants created
+    # with wrong timestamps never recover after NTP corrects the clock.
+    while time.time() < _MIN_EPOCH:
+        logger.warning("System clock not yet synchronised (%.0f < %d). "
+                       "Waiting for NTP...", time.time(), _MIN_EPOCH)
+        time.sleep(2)
+    logger.info("System clock OK (%.0f). Initialising ROS 2...", time.time())
 
     # -- rclpy --------------------------------------------------------------- #
     rclpy.init(args=args)
