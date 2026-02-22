@@ -24,7 +24,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy
 
 from geometry_msgs.msg import Twist
-from sensor_msgs.msg import CompressedImage, Imu, JointState, LaserScan, BatteryState
+from sensor_msgs.msg import CompressedImage, Imu, JointState, LaserScan, BatteryState, MagneticField
 from nav_msgs.msg import Odometry
 from vision_msgs.msg import Detection2DArray
 
@@ -624,6 +624,7 @@ _MSG_TYPE_MAP = {
     "sensor_msgs/JointState":        JointState,
     "sensor_msgs/LaserScan":         LaserScan,
     "sensor_msgs/BatteryState":      BatteryState,
+    "sensor_msgs/MagneticField":     MagneticField,
     "nav_msgs/Odometry":             Odometry,
     "vision_msgs/Detection2DArray":  Detection2DArray,
 }
@@ -792,3 +793,20 @@ def joint_state_to_dict(msg) -> dict:
             "velocity_rad_s": round(msg.velocity[i], 4) if i < len(msg.velocity) else None,
         }
     return {"joints": joints}
+
+
+def magnetic_field_to_dict(msg) -> dict:
+    """Serialise sensor_msgs/MagneticField to a plain dict.
+
+    Values are in Tesla (SI).  Earth's field is typically 25–65 µT total,
+    so expect values on the order of ±50e-6 T.
+    """
+    f = msg.magnetic_field
+    magnitude = math.sqrt(f.x**2 + f.y**2 + f.z**2)
+    return {
+        "x_T": round(f.x, 9),
+        "y_T": round(f.y, 9),
+        "z_T": round(f.z, 9),
+        "magnitude_T": round(magnitude, 9),
+        "magnitude_uT": round(magnitude * 1e6, 3),
+    }

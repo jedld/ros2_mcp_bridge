@@ -74,11 +74,18 @@ ros2_mcp_bridge:
       type: turtlebot3_msgs/SensorState
 
     # IMU data (orientation, angular velocity, linear acceleration).
-    # On the Pico variant the IMU is simulated; on stock TurtleBot3 this
-    # is a real 6-axis IMU (MPU-9250 on the OpenCR board).
+    # On the Pico variant this is the BNO055 / BNO085 9-DOF NDOF fusion sensor
+    # (Grove 6 / Grove 1).  On stock TurtleBot3 this is the MPU-9250 on OpenCR.
     imu:
       topic: /imu
       type: sensor_msgs/Imu
+
+    # Magnetometer (calibrated, SI Tesla).
+    # Published by the BNO055/BNO085 on the Pico variant.
+    # Not available on stock TurtleBot3 (OpenCR does not expose a /mag topic).
+    mag:
+      topic: /mag
+      type: sensor_msgs/MagneticField
 
     # Wheel joint positions and velocities from the encoders.
     joint_states:

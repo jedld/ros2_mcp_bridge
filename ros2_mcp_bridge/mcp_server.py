@@ -60,6 +60,7 @@ from ros2_mcp_bridge.ros_node import (
     battery_state_to_dict,
     imu_to_dict,
     joint_state_to_dict,
+    magnetic_field_to_dict,
 )
 
 # Singleton reference injected by bridge.py before the server starts
@@ -467,9 +468,11 @@ def play_sound(value: int = 1, timeout: float = 5.0) -> str:
     description=(
         "Return the robot's IMU (Inertial Measurement Unit) data: orientation "
         "as roll/pitch/yaw in degrees, angular velocity, and linear acceleration. "
-        "On the Pico variant the IMU is simulated (orientation from odometry, "
-        "acceleration z≈9.81); on the stock TurtleBot3 this is a real IMU. "
-        "Useful for detecting tilt, stuck conditions, or verifying rotation."
+        "On the Pico variant this is the BNO055 9-DOF NDOF fusion sensor providing "
+        "absolute orientation (quaternion fused from accelerometer, gyroscope, and "
+        "magnetometer). On the stock TurtleBot3 this is the MPU-9250 on OpenCR. "
+        "Useful for detecting tilt, stuck conditions, verifying rotation, or "
+        "reading the absolute heading of the robot."
     ),
 )
 def get_imu(timeout: float = 2.0) -> str:
@@ -483,6 +486,30 @@ def get_imu(timeout: float = 2.0) -> str:
     if msg is None:
         return json.dumps({"error": f"No IMU data received on {topic} within {timeout}s."})
     return json.dumps(imu_to_dict(msg))
+
+
+@mcp.tool(
+    title="Get Magnetometer",
+    description=(
+        "Return the calibrated magnetometer reading from the BNO055/BNO085 IMU. "
+        "Values are in Tesla (SI); Earth's field is typically 25–65 µT total "
+        "(2.5e-5 to 6.5e-5 T). Can be used to infer absolute compass heading. "
+        "Only available on the Pico variant with a real IMU attached. "
+        "Returns an error on stock TurtleBot3 (no /mag topic)."
+    ),
+)
+def get_magnetometer(timeout: float = 2.0) -> str:
+    """
+    Args:
+        timeout: Seconds to wait for a MagneticField message (default 2.0).
+    """
+    cfg_topics = _node._cfg.get("topics", {})
+    topic = cfg_topics.get("mag", {}).get("topic", "/mag")
+    msg = _node.get_latest(topic, timeout=timeout)
+    if msg is None:
+        return json.dumps({"error": f"No magnetometer data received on {topic} within {timeout}s. "
+                           "Requires BNO055/BNO085 IMU on the Pico variant."})
+    return json.dumps(magnetic_field_to_dict(msg))
 
 
 @mcp.tool(
