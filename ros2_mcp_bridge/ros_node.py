@@ -24,7 +24,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy
 
 from geometry_msgs.msg import Twist
-from sensor_msgs.msg import CompressedImage, LaserScan, BatteryState
+from sensor_msgs.msg import CompressedImage, Imu, JointState, LaserScan, BatteryState
 from nav_msgs.msg import Odometry
 from vision_msgs.msg import Detection2DArray
 
@@ -237,6 +237,52 @@ class ROS2BridgeNode(Node):
         """Return the current service list from the ROS graph."""
         return self.get_service_names_and_types()
 
+    def play_sound(self, value: int, timeout: float = 5.0) -> dict:
+        """Call the /sound service to play a TurtleBot3 sound.
+
+        Values: 0=OFF, 1=ON, 2=LOW_BATTERY, 3=ERROR, 4=BUTTON1, 5=BUTTON2.
+        Works on both stock OpenCR and Pico variant.
+        """
+        try:
+            from turtlebot3_msgs.srv import Sound
+        except ImportError:
+            return {"status": "failed",
+                    "message": "turtlebot3_msgs not installed."}
+        client = self.create_client(Sound, "/sound")
+        if not client.wait_for_service(timeout_sec=timeout):
+            return {"status": "failed",
+                    "message": "/sound service not available."}
+        req = Sound.Request()
+        req.value = int(value)
+        future = client.call_async(req)
+        deadline = time.time() + timeout
+        while not future.done() and time.time() < deadline:
+            time.sleep(0.05)
+        if not future.done():
+            return {"status": "failed", "message": "Service call timed out."}
+        result = future.result()
+        return {"status": "succeeded" if result.success else "failed",
+                "message": result.message}
+
+    def set_motor_power(self, enable: bool, timeout: float = 5.0) -> dict:
+        """Call the /motor_power service to enable or disable wheel torque."""
+        from std_srvs.srv import SetBool
+        client = self.create_client(SetBool, "/motor_power")
+        if not client.wait_for_service(timeout_sec=timeout):
+            return {"status": "failed",
+                    "message": "/motor_power service not available."}
+        req = SetBool.Request()
+        req.data = bool(enable)
+        future = client.call_async(req)
+        deadline = time.time() + timeout
+        while not future.done() and time.time() < deadline:
+            time.sleep(0.05)
+        if not future.done():
+            return {"status": "failed", "message": "Service call timed out."}
+        result = future.result()
+        return {"status": "succeeded" if result.success else "failed",
+                "message": result.message}
+
     def reset_odometry(self, timeout: float = 5.0) -> dict:
         """Call the /reset_odometry service to zero the odometry pose."""
         from std_srvs.srv import Trigger
@@ -323,6 +369,8 @@ class ROS2BridgeNode(Node):
 
 _MSG_TYPE_MAP = {
     "sensor_msgs/CompressedImage":   CompressedImage,
+    "sensor_msgs/Imu":               Imu,
+    "sensor_msgs/JointState":        JointState,
     "sensor_msgs/LaserScan":         LaserScan,
     "sensor_msgs/BatteryState":      BatteryState,
     "nav_msgs/Odometry":             Odometry,
@@ -446,3 +494,50 @@ def battery_state_to_dict(msg) -> dict:
         "percentage": round(msg.percentage, 2) if not math.isnan(msg.percentage) else None,
         "present": bool(msg.present),
     }
+
+
+def imu_to_dict(msg) -> dict:
+    """Serialise sensor_msgs/Imu to a plain dict with Euler angles."""
+    q = msg.orientation
+    # Quaternion → roll / pitch / yaw
+    sinr_cosp = 2.0 * (q.w * q.x + q.y * q.z)
+    cosr_cosp = 1.0 - 2.0 * (q.x * q.x + q.y * q.y)
+    roll = math.atan2(sinr_cosp, cosr_cosp)
+
+    sinp = 2.0 * (q.w * q.y - q.z * q.x)
+    pitch = math.asin(max(-1.0, min(1.0, sinp)))
+
+    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    yaw = math.atan2(siny_cosp, cosy_cosp)
+
+    av = msg.angular_velocity
+    la = msg.linear_acceleration
+    return {
+        "orientation": {
+            "roll_deg":  round(math.degrees(roll), 2),
+            "pitch_deg": round(math.degrees(pitch), 2),
+            "yaw_deg":   round(math.degrees(yaw), 2),
+        },
+        "angular_velocity": {
+            "x": round(av.x, 4),
+            "y": round(av.y, 4),
+            "z": round(av.z, 4),
+        },
+        "linear_acceleration": {
+            "x": round(la.x, 4),
+            "y": round(la.y, 4),
+            "z": round(la.z, 4),
+        },
+    }
+
+
+def joint_state_to_dict(msg) -> dict:
+    """Serialise sensor_msgs/JointState to a plain dict."""
+    joints = {}
+    for i, name in enumerate(msg.name):
+        joints[name] = {
+            "position_rad": round(msg.position[i], 4) if i < len(msg.position) else None,
+            "velocity_rad_s": round(msg.velocity[i], 4) if i < len(msg.velocity) else None,
+        }
+    return {"joints": joints}

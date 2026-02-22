@@ -257,3 +257,4 @@ EOF
 5. **Serialiser functions return plain `dict`**, never raw rclpy messages.
 6. **The deadman watchdog in `ros_node.py` must not be removed** — it is a safety requirement.
 7. **The `run()` function signature in `mcp_server.py`** must stay as `run(transport, host, port, path, options=None)` — onit calls it with this signature.
+8. **Code should not be assumed to be turtlebot3 specific or specific to a particular robot** if it is a robot feature or parameter specific either use automatic referencing from queriable parameters or via a config in bridge.yaml.

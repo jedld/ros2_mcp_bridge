@@ -58,6 +58,8 @@ from ros2_mcp_bridge.ros_node import (
     detections_to_dict,
     sensor_state_to_dict,
     battery_state_to_dict,
+    imu_to_dict,
+    joint_state_to_dict,
 )
 
 # Singleton reference injected by bridge.py before the server starts
@@ -335,6 +337,96 @@ def reset_odometry(timeout: float = 5.0) -> str:
         timeout: Seconds to wait for the service (default 5.0).
     """
     result = _node.reset_odometry(timeout)
+    return json.dumps(result)
+
+
+@mcp.tool(
+    title="Play Sound",
+    description=(
+        "Play a sound on the robot's buzzer. Works on both stock TurtleBot3 "
+        "(OpenCR) and Pico variant. Available sounds: 0=OFF (silence), "
+        "1=ON (startup melody), 2=LOW_BATTERY (warning beeps), "
+        "3=ERROR (rapid low-pitch bursts), 4=BUTTON1 (short blip), "
+        "5=BUTTON2 (ascending blips). "
+        "Use this to provide audible feedback to the user, signal errors, "
+        "or confirm actions."
+    ),
+)
+def play_sound(value: int = 1, timeout: float = 5.0) -> str:
+    """
+    Args:
+        value: Sound ID (0-5). 0=OFF, 1=ON, 2=LOW_BATTERY, 3=ERROR,
+               4=BUTTON1, 5=BUTTON2. Default 1.
+        timeout: Seconds to wait for the service (default 5.0).
+    """
+    if not 0 <= value <= 5:
+        return json.dumps({"error": f"Invalid sound value {value}; must be 0-5."})
+    result = _node.play_sound(value, timeout)
+    return json.dumps(result)
+
+
+@mcp.tool(
+    title="Get IMU",
+    description=(
+        "Return the robot's IMU (Inertial Measurement Unit) data: orientation "
+        "as roll/pitch/yaw in degrees, angular velocity, and linear acceleration. "
+        "On the Pico variant the IMU is simulated (orientation from odometry, "
+        "acceleration z≈9.81); on the stock TurtleBot3 this is a real IMU. "
+        "Useful for detecting tilt, stuck conditions, or verifying rotation."
+    ),
+)
+def get_imu(timeout: float = 2.0) -> str:
+    """
+    Args:
+        timeout: Seconds to wait for an IMU message (default 2.0).
+    """
+    cfg_topics = _node._cfg.get("topics", {})
+    topic = cfg_topics.get("imu", {}).get("topic", "/imu")
+    msg = _node.get_latest(topic, timeout=timeout)
+    if msg is None:
+        return json.dumps({"error": f"No IMU data received on {topic} within {timeout}s."})
+    return json.dumps(imu_to_dict(msg))
+
+
+@mcp.tool(
+    title="Get Joint States",
+    description=(
+        "Return the current wheel joint positions (radians) and velocities "
+        "(rad/s). The TurtleBot3 has two joints: wheel_left_joint and "
+        "wheel_right_joint. Useful for verifying that wheels are actually "
+        "turning, detecting stuck wheels, or computing distance travelled "
+        "from encoder deltas."
+    ),
+)
+def get_joint_states(timeout: float = 2.0) -> str:
+    """
+    Args:
+        timeout: Seconds to wait for a JointState message (default 2.0).
+    """
+    cfg_topics = _node._cfg.get("topics", {})
+    topic = cfg_topics.get("joint_states", {}).get("topic", "/joint_states")
+    msg = _node.get_latest(topic, timeout=timeout)
+    if msg is None:
+        return json.dumps({"error": f"No joint state data received on {topic} within {timeout}s."})
+    return json.dumps(joint_state_to_dict(msg))
+
+
+@mcp.tool(
+    title="Set Motor Power",
+    description=(
+        "Enable or disable the robot's wheel motor torque. When disabled, "
+        "the wheels can be moved freely by hand (useful for manual positioning). "
+        "When enabled, the motors hold position and respond to velocity commands. "
+        "Calls the /motor_power service provided by turtlebot3_node."
+    ),
+)
+def set_motor_power(enable: bool = True, timeout: float = 5.0) -> str:
+    """
+    Args:
+        enable: True to enable motor torque, False to disable (default True).
+        timeout: Seconds to wait for the service (default 5.0).
+    """
+    result = _node.set_motor_power(enable, timeout)
     return json.dumps(result)
 
 

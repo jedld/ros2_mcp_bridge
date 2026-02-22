@@ -68,6 +68,18 @@ ros2_mcp_bridge:
       topic: /sensor_state
       type: turtlebot3_msgs/SensorState
 
+    # IMU data (orientation, angular velocity, linear acceleration).
+    # On the Pico variant the IMU is simulated; on stock TurtleBot3 this
+    # is a real 6-axis IMU (MPU-9250 on the OpenCR board).
+    imu:
+      topic: /imu
+      type: sensor_msgs/Imu
+
+    # Wheel joint positions and velocities from the encoders.
+    joint_states:
+      topic: /joint_states
+      type: sensor_msgs/JointState
+
     # Uncomment to also subscribe to AMCL / map-frame pose
     # amcl_pose:
     #   topic: /amcl_pose
