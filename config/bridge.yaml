@@ -30,6 +30,39 @@ ros2_mcp_bridge:
   # Approximate image width used for steering heuristic in approach_object
   image_width: 640
 
+  # Horizontal field of view of the camera (degrees).
+  # Used to map detection bounding-box pixel positions to LiDAR angles
+  # and for pinhole-model depth estimation.  Typical webcams: 55–70°.
+  camera_hfov_deg: 62.0
+
+  # Height of the 2D LiDAR scan plane above ground (metres).
+  # Objects whose top is below this height generate no LiDAR return;
+  # the bridge uses a bbox-based depth estimate as fallback.
+  lidar_height_m: 0.13
+
+  # ── Approach object tuning ─────────────────────────────────────────────── #
+  # Controls approach_object behaviour — tune these to match your detector
+  # latency and robot dynamics.  No rebuild needed; just restart the bridge.
+  approach_object:
+    max_speed: 0.15          # m/s — cruise speed when far from the target
+    min_speed: 0.05          # m/s — minimum speed when close (reduces motion blur)
+    step_size: 0.15          # m — incremental drive distance per step during blind approach
+    slow_distance: 0.8       # m — start decelerating when closer than this
+    lost_retries: 5          # stop-and-rescan attempts before declaring target lost
+    rescan_pause: 0.4        # seconds to wait after stopping for a clean frame
+    vlm_fallback: true       # ask VLM to verify when YOLO loses track (requires
+                             # vlm_agent.enabled: true above)
+
+  # ── DSL Runtime ───────────────────────────────────────────────────────── #
+  # Python-DSL execution engine for real-time reactive robot behaviours.
+  # The LLM writes small Python programs that run locally on the robot,
+  # closing the sense→decide→act loop at ~20 Hz without round-tripping
+  # every sensor frame to the cloud.
+  dsl_runtime:
+    enabled: true              # Set to false to disable all DSL tools
+    default_timeout: 30.0      # Default max execution time per run (seconds)
+    max_timeout: 300.0         # Hard ceiling on per-run timeout (seconds)
+
   # ── Collision avoidance ───────────────────────────────────────────────── #
   # LiDAR-based collision avoidance applied to all linear motion commands.
   # Each movement tool also exposes a per-call `collision_avoidance` parameter
@@ -57,8 +90,8 @@ ros2_mcp_bridge:
       type: nav_msgs/Odometry
 
     detections:
-      topic: /detections
-      type: vision_msgs/Detection2DArray
+     topic: /detections
+     type: vision_msgs/Detection2DArray
 
     # Battery state (sensor_msgs/BatteryState) — available on both stock
     # TurtleBot3 and Pico variants.  Tools degrade gracefully if absent.
@@ -82,9 +115,10 @@ ros2_mcp_bridge:
 
     # Magnetometer (calibrated, SI Tesla).
     # Published by the BNO055/BNO085 on the Pico variant.
-    # Not available on stock TurtleBot3 (OpenCR does not expose a /mag topic).
+    # /magnetic_field is published by turtlebot3_node on the Burger with BNO055.
+    # /mag is an alias some configurations remap to; /magnetic_field is authoritative.
     mag:
-      topic: /mag
+      topic: /magnetic_field
       type: sensor_msgs/MagneticField
 
     # Wheel joint positions and velocities from the encoders.
@@ -96,3 +130,34 @@ ros2_mcp_bridge:
     # amcl_pose:
     #   topic: /amcl_pose
     #   type: geometry_msgs/PoseWithCovarianceStamped
+
+  # ── VLM Vision Sub-agent (A2A) ────────────────────────────────────────── #
+  # A dedicated Vision-Language Model agent running as an onit A2A server.
+  # The planner calls ask_vision_agent(); the bridge forwards the camera frame
+  # and question here and returns the VLM's analysis.
+  #
+  # Setup:
+  #   1. Install onit on the robot:  pip install onit
+  #   2. Copy onit/configs/vlm_agent.yaml to the robot and edit the model URL.
+  #   3. Start the VLM A2A server on the robot:
+  #        onit --a2a --config /path/to/vlm_agent.yaml
+  #   4. Set enabled: true below and restart the bridge.
+  #
+  # The VLM agent only needs a vision-capable model endpoint (vLLM, Ollama,
+  # OpenRouter etc.) and the onit PromptsMCPServer on the same host.
+  vlm_agent:
+    enabled: false
+    url: http://localhost:9002   # A2A server URL (onit --a2a --config configs/vlm_agent.yaml)
+    # timeout is controlled per-call via ask_vision_agent's timeout parameter
+
+  # Cosmos-Reason2-8B — NVIDIA robotics-specific VLM.
+  # Fine-tuned from Qwen3-VL for physical AI: embodied reasoning, navigation
+  # safety, obstacle avoidance, and "what should the robot do next?" planning.
+  # Best at: is it safe to move forward? spatial bounding boxes, action planning.
+  #
+  # Start the A2A agent on the robot:
+  #   onit --a2a --config ~/turtlebot3_ws/onit/configs/cosmos_agent.yaml
+  cosmos_agent:
+    enabled: false
+    url: http://localhost:9003   # A2A server URL (onit --a2a --config configs/cosmos_agent.yaml)
+    # timeout is controlled per-call via ask_cosmos_agent's timeout parameter

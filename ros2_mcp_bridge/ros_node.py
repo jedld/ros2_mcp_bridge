@@ -69,6 +69,9 @@ class ROS2BridgeNode(Node):
         self._cmd_lock = threading.Lock()
         self._last_cmd_time = 0.0
 
+        # Stop / cancel event: set by stop() to abort running behaviours
+        self._stop_event = threading.Event()
+
         # Nav2 action client (created lazily)
         self._nav_client = None
         self._nav_lock = threading.Lock()
@@ -118,13 +121,14 @@ class ROS2BridgeNode(Node):
     def _ensure_cache_entry(self, topic: str):
         with self._cache_lock:
             if topic not in self._cache:
-                self._cache[topic] = {"msg": None, "event": threading.Event()}
+                self._cache[topic] = {"msg": None, "event": threading.Event(), "stamp": 0.0}
 
     def _cache_cb(self, topic: str, msg):
         """Generic callback: store latest message and signal waiters."""
         with self._cache_lock:
-            entry = self._cache.setdefault(topic, {"msg": None, "event": threading.Event()})
+            entry = self._cache.setdefault(topic, {"msg": None, "event": threading.Event(), "stamp": 0.0})
             entry["msg"] = msg
+            entry["stamp"] = time.monotonic()
             entry["event"].set()
 
     # ------------------------------------------------------------------ #
@@ -156,6 +160,33 @@ class ROS2BridgeNode(Node):
                 return None
         return entry["msg"]
 
+    def get_fresh(self, topic: str, timeout: float = 3.0) -> Optional[Any]:
+        """
+        Block until a NEW message arrives on *topic*, ignoring any
+        previously cached value.  Essential for behaviours that need
+        the latest sensor reading after the robot has moved or stopped.
+
+        Unlike ``get_latest`` (which returns the cached message
+        immediately), this clears the arrival flag and waits for the
+        next publication.  Returns None if no message arrives within
+        *timeout* seconds.
+        """
+        self._ensure_cache_entry(topic)
+        entry = self._cache[topic]
+        entry["event"].clear()
+        if not entry["event"].wait(timeout):
+            return None
+        return entry["msg"]
+
+    def get_cache_age(self, topic: str) -> float:
+        """Seconds since the last message on *topic*.  Returns ``inf`` if
+        no message has ever been received."""
+        with self._cache_lock:
+            entry = self._cache.get(topic)
+            if entry is None or entry["stamp"] == 0.0:
+                return float('inf')
+            return time.monotonic() - entry["stamp"]
+
     def publish_twist(self, linear_x: float, angular_z: float):
         """Publish a Twist to cmd_vel and reset the deadman timer."""
         t = Twist()
@@ -180,15 +211,26 @@ class ROS2BridgeNode(Node):
         period = 1.0 / rate_hz
         end_time = time.time() + duration
         while time.time() < end_time:
+            if self._stop_event.is_set():
+                break
             self.publish_twist(linear_x, angular_z)
             time.sleep(period)
-        self.stop()
+        self._cmd_pub.publish(Twist())
 
     def stop(self):
-        """Immediately publish a zero-velocity Twist."""
+        """Immediately publish a zero-velocity Twist and signal running behaviours to cancel."""
+        self._stop_event.set()
         self._cmd_pub.publish(Twist())
         with self._cmd_lock:
             self._last_cmd_time = 0.0
+
+    def clear_stop_event(self):
+        """Clear the cancellation flag.  Call at the start of a new behaviour."""
+        self._stop_event.clear()
+
+    def is_stop_requested(self) -> bool:
+        """Return True if stop() has been called since last clear_stop_event()."""
+        return self._stop_event.is_set()
 
     # ------------------------------------------------------------------ #
     # Odometry helpers
@@ -211,6 +253,39 @@ class ROS2BridgeNode(Node):
     # ------------------------------------------------------------------ #
     # Closed-loop distance / rotation
     # ------------------------------------------------------------------ #
+
+    def _recover_from_stuck(
+        self,
+        direction: float,
+        speed: float,
+        travelled: float,
+        distance_m: float,
+    ) -> dict:
+        """
+        Called when stuck is detected.  Reverses 0.15 m (ignoring collision
+        avoidance) to un-wedge the robot, then returns a 'stuck' result dict
+        so the caller (and ultimately the LLM) knows what happened.
+        """
+        self.stop()
+        reverse_dist = 0.15
+        rev = self.move_distance(
+            -direction * reverse_dist,
+            speed=max(0.05, speed * 0.5),
+            timeout=6.0,
+            collision_avoidance=False,
+        )
+        return {
+            "status": "stuck",
+            "distance_requested": round(distance_m, 4),
+            "distance_actual": round(direction * travelled, 4),
+            "message": (
+                f"Robot stuck after {round(travelled, 3)} m — motor commands "
+                f"were active but odometry showed no movement. "
+                f"Reversed {abs(rev.get('distance_actual', 0.0)):.2f} m to recover."
+            ),
+            "recovery_action": "reversed",
+            "recovery_distance_m": rev.get("distance_actual", 0.0),
+        }
 
     def move_distance(
         self,
@@ -256,7 +331,22 @@ class ROS2BridgeNode(Node):
         travelled = 0.0
         prev = start
 
+        # Stuck detection: consecutive loops with negligible odom progress
+        # while commanding meaningful speed → robot is wedged / high-centred.
+        _STUCK_STEP_THRESH = 0.003   # m per 20 Hz loop ≈ 0.06 m/s effective
+        _STUCK_CMD_THRESH  = 0.08    # only flag if cmd ≥ this (ignore slow ramp)
+        _STUCK_MAX_COUNT   = 20      # 20 × 50 ms = 1.0 s of zero progress
+        stuck_count = 0
+
         while travelled < target and time.time() < deadline:
+            if self._stop_event.is_set():
+                self._cmd_pub.publish(Twist())
+                return {
+                    "status": "cancelled",
+                    "distance_requested": round(distance_m, 4),
+                    "distance_actual": round(direction * travelled, 4),
+                    "message": "Motion cancelled by stop command.",
+                }
             # Proportional slow-down in the last 0.05 m
             remaining = target - travelled
             cmd_speed = speed if remaining > 0.05 else max(0.05, speed * (remaining / 0.05))
@@ -271,6 +361,14 @@ class ROS2BridgeNode(Node):
             step = math.sqrt(dx * dx + dy * dy) / scale
             travelled += step
             prev = cur
+
+            # Stuck detection
+            if cmd_speed >= _STUCK_CMD_THRESH and step < _STUCK_STEP_THRESH:
+                stuck_count += 1
+                if stuck_count >= _STUCK_MAX_COUNT:
+                    return self._recover_from_stuck(direction, speed, travelled, distance_m)
+            else:
+                stuck_count = 0
 
             # Periodic collision check
             if collision_avoidance and int(travelled * 100) % 10 == 0:
@@ -325,7 +423,22 @@ class ROS2BridgeNode(Node):
         rotated = 0.0
         prev_yaw = start[2]
 
+        # Stuck detection for rotation: wheel drag / carpet / obstacle
+        _STUCK_YAW_THRESH = 0.002    # rad per 20 Hz loop ≈ 0.04 rad/s effective
+        _STUCK_CMD_THRESH = 0.25     # only flag if cmd ≥ this rad/s (ignore slow ramp)
+        _STUCK_MAX_COUNT  = 20       # 20 × 50 ms = 1.0 s of zero angular progress
+        stuck_count = 0
+
         while rotated < target_rad and time.time() < deadline:
+            if self._stop_event.is_set():
+                self._cmd_pub.publish(Twist())
+                actual_deg = math.degrees(rotated) * direction
+                return {
+                    "status": "cancelled",
+                    "angle_requested_deg": round(angle_deg, 2),
+                    "angle_actual_deg": round(actual_deg, 2),
+                    "message": "Rotation cancelled by stop command.",
+                }
             remaining = target_rad - rotated
             # Slow down in the last 10 degrees
             if remaining < math.radians(10):
@@ -346,6 +459,36 @@ class ROS2BridgeNode(Node):
                 d_yaw += 2 * math.pi
             rotated += abs(d_yaw)
             prev_yaw = cur[2]
+
+            # Stuck detection
+            if cmd_speed >= _STUCK_CMD_THRESH and abs(d_yaw) < _STUCK_YAW_THRESH:
+                stuck_count += 1
+                if stuck_count >= _STUCK_MAX_COUNT:
+                    self.stop()
+                    # Best recovery for rotation stall: short linear reverse
+                    rev = self.move_distance(
+                        -0.10,
+                        speed=self._max_linear_speed * 0.4,
+                        timeout=4.0,
+                        collision_avoidance=False,
+                    )
+                    actual_deg = math.degrees(rotated) * direction
+                    return {
+                        "status": "stuck",
+                        "angle_requested_deg": round(angle_deg, 2),
+                        "angle_actual_deg": round(actual_deg, 2),
+                        "message": (
+                            f"Robot stuck during rotation after "
+                            f"{round(math.degrees(rotated), 1)}° — "
+                            f"motor commands active but odometry showed no "
+                            f"angular movement. Reversed "
+                            f"{abs(rev.get('distance_actual', 0.0)):.2f} m to recover."
+                        ),
+                        "recovery_action": "reversed",
+                        "recovery_distance_m": rev.get("distance_actual", 0.0),
+                    }
+            else:
+                stuck_count = 0
 
         self.stop()
 
@@ -688,6 +831,324 @@ def laser_scan_to_dict(msg: LaserScan) -> dict:
         "rear_min_m":   sector_min(90, 270),
         "right_min_m":  sector_min(270, 330),
         "full_ranges":  [round(float(r), 3) if not math.isnan(r) else None for r in ranges],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Distance estimation helpers (camera ↔ LiDAR fusion)
+# --------------------------------------------------------------------------- #
+
+# Approximate real-world heights (metres) for common COCO classes.
+# Used by the pinhole-model fallback when LiDAR has no return for an object.
+_COCO_TYPICAL_HEIGHT_M: dict[str, float] = {
+    "person": 1.70, "bicycle": 1.10, "car": 1.50, "motorcycle": 1.10,
+    "bus": 3.00, "truck": 2.80, "cat": 0.30, "dog": 0.50,
+    "chair": 0.80, "couch": 0.85, "dining table": 0.75,
+    "bed": 0.60, "toilet": 0.45, "tv": 0.40, "laptop": 0.25,
+    "mouse": 0.04, "keyboard": 0.04, "cell phone": 0.15,
+    "microwave": 0.30, "oven": 0.85, "refrigerator": 1.70,
+    "book": 0.25, "clock": 0.30, "vase": 0.30, "cup": 0.12,
+    "bottle": 0.25, "wine glass": 0.22, "fork": 0.03, "knife": 0.03,
+    "spoon": 0.03, "bowl": 0.10, "banana": 0.05, "apple": 0.08,
+    "sandwich": 0.08, "orange": 0.08, "backpack": 0.50, "umbrella": 1.00,
+    "handbag": 0.30, "suitcase": 0.55, "potted plant": 0.40,
+    "teddy bear": 0.35, "toothbrush": 0.02, "remote": 0.06,
+    "scissors": 0.10, "sports ball": 0.22,
+}
+
+
+def lidar_distance_for_bbox(
+    scan_msg: LaserScan,
+    cx: float,
+    bbox_w: float,
+    image_width: float = 640.0,
+    hfov_deg: float = 62.0,
+    min_angular_window_deg: float = 5.0,
+) -> tuple[float | None, int]:
+    """Map a detection bbox to LiDAR angles and sample those rays.
+
+    Parameters
+    ----------
+    scan_msg : LaserScan
+        Raw LiDAR message.
+    cx : float
+        Horizontal centre of the bounding box in pixels.
+    bbox_w : float
+        Width of the bounding box in pixels.
+    image_width : float
+        Image width in pixels (default 640).
+    hfov_deg : float
+        Camera horizontal field-of-view in degrees.
+    min_angular_window_deg : float
+        Minimum half-width of the angular sampling window (degrees).
+
+    Returns
+    -------
+    (distance_m, n_valid_rays) — distance_m is None if no valid rays found.
+    """
+    half_hfov = hfov_deg / 2.0
+
+    # Pixel offset from image centre → angle in degrees
+    # Positive angle = right of centre in image → negative LiDAR angle
+    # (LiDAR convention: counter-clockwise positive, camera x: left-to-right)
+    pixel_offset = cx - image_width / 2.0
+    centre_angle_deg = -(pixel_offset / (image_width / 2.0)) * half_hfov
+
+    # Angular half-width of the bbox
+    bbox_half_angle_deg = max(
+        (bbox_w / image_width) * half_hfov,
+        min_angular_window_deg,
+    )
+
+    start_deg = centre_angle_deg - bbox_half_angle_deg
+    end_deg = centre_angle_deg + bbox_half_angle_deg
+
+    # Sample LiDAR rays in [start_deg, end_deg]
+    ranges = np.array(scan_msg.ranges, dtype=np.float32)
+    ranges = np.where(
+        (ranges < scan_msg.range_min) | (ranges > scan_msg.range_max),
+        np.nan, ranges,
+    )
+    n = len(ranges)
+    inc_deg = math.degrees(scan_msg.angle_increment)
+    min_deg = math.degrees(scan_msg.angle_min)
+
+    i0 = int((start_deg - min_deg) / inc_deg) % n
+    i1 = int((end_deg - min_deg) / inc_deg) % n
+
+    if i0 < i1:
+        sector = ranges[i0:i1 + 1]
+    else:
+        sector = np.concatenate([ranges[i0:], ranges[: i1 + 1]])
+
+    valid = sector[~np.isnan(sector)]
+    if len(valid) == 0:
+        return None, 0
+    return float(np.min(valid)), int(len(valid))
+
+
+def bearing_from_bbox(
+    cx: float,
+    image_width: float = 640.0,
+    hfov_deg: float = 62.0,
+) -> float:
+    """Convert a bounding-box centre x-pixel to a bearing angle in radians.
+
+    Returns a signed angle: positive = object is to the *left* of the
+    camera centre (counter-clockwise positive, matching the LiDAR /
+    ROS convention).
+    """
+    half_hfov = hfov_deg / 2.0
+    pixel_offset = cx - image_width / 2.0
+    bearing_deg = -(pixel_offset / (image_width / 2.0)) * half_hfov
+    return math.radians(bearing_deg)
+
+
+def motion_stereo_depth(
+    node: "ROS2BridgeNode",
+    cam_topic: str,
+    bbox: dict,
+    image_width: float = 640.0,
+    hfov_deg: float = 62.0,
+    baseline_m: float = 0.08,
+) -> float | None:
+    """Estimate depth at a bounding-box location using motion parallax.
+
+    The robot nudges forward by *baseline_m*, captures two JPEG frames
+    (before / after), matches ORB features inside the bbox region, and
+    uses the median horizontal disparity to triangulate depth:
+
+        depth = focal_px * baseline_m / median_disparity
+
+    Returns the estimated depth in metres, or None on failure.  The robot
+    is returned to its original position afterward.
+    """
+    import cv2
+
+    focal_px = (image_width / 2.0) / math.tan(math.radians(hfov_deg / 2.0))
+
+    # Region of interest (expand bbox by 20% for better feature matching)
+    cx, cy = bbox["cx"], bbox["cy"]
+    bw, bh = bbox["w"], bbox["h"]
+    margin = 0.2
+    x1 = int(max(0, cx - bw / 2 * (1 + margin)))
+    y1 = int(max(0, cy - bh / 2 * (1 + margin)))
+    x2 = int(cx + bw / 2 * (1 + margin))
+    y2 = int(cy + bh / 2 * (1 + margin))
+
+    # Capture frame 1
+    msg1 = node.get_fresh(cam_topic, timeout=1.5)
+    if msg1 is None:
+        return None
+    buf1 = np.frombuffer(bytes(msg1.data), dtype=np.uint8)
+    img1 = cv2.imdecode(buf1, cv2.IMREAD_GRAYSCALE)
+    if img1 is None:
+        return None
+
+    # Nudge forward
+    node.move_distance(baseline_m, speed=0.05, timeout=5.0, collision_avoidance=True)
+
+    # Capture frame 2
+    msg2 = node.get_fresh(cam_topic, timeout=1.5)
+    if msg2 is None:
+        # Nudge back
+        node.move_distance(-baseline_m, speed=0.05, timeout=5.0, collision_avoidance=False)
+        return None
+    buf2 = np.frombuffer(bytes(msg2.data), dtype=np.uint8)
+    img2 = cv2.imdecode(buf2, cv2.IMREAD_GRAYSCALE)
+    if img2 is None:
+        node.move_distance(-baseline_m, speed=0.05, timeout=5.0, collision_avoidance=False)
+        return None
+
+    # Nudge back to original position
+    node.move_distance(-baseline_m, speed=0.05, timeout=5.0, collision_avoidance=False)
+
+    # Clamp ROI to image bounds
+    h, w = img1.shape[:2]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    if x2 - x1 < 20 or y2 - y1 < 20:
+        return None
+
+    roi1 = img1[y1:y2, x1:x2]
+    roi2 = img2[y1:y2, x1:x2]
+
+    # ORB feature matching
+    orb = cv2.ORB_create(nfeatures=200)
+    kp1, des1 = orb.detectAndCompute(roi1, None)
+    kp2, des2 = orb.detectAndCompute(roi2, None)
+
+    if des1 is None or des2 is None or len(kp1) < 5 or len(kp2) < 5:
+        return None
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des1, des2)
+    if len(matches) < 3:
+        return None
+
+    # Compute horizontal disparities (motion is forward → points move outward
+    # from the focus of expansion at image centre)
+    disparities = []
+    for m in matches:
+        pt1 = kp1[m.queryIdx].pt
+        pt2 = kp2[m.trainIdx].pt
+        dx = abs(pt2[0] - pt1[0])
+        if dx > 0.5:  # ignore sub-pixel noise
+            disparities.append(dx)
+
+    if len(disparities) < 3:
+        return None
+
+    median_disp = float(np.median(disparities))
+    if median_disp < 1.0:
+        return None  # too small → object is very far away, unreliable
+
+    depth = focal_px * baseline_m / median_disp
+    # Sanity: clamp to 0.1 – 10 m
+    if depth < 0.1 or depth > 10.0:
+        return None
+
+    return round(depth, 3)
+
+
+def bbox_depth_estimate(
+    bbox_h: float,
+    label: str,
+    image_height: float = 480.0,
+    image_width: float = 640.0,
+    hfov_deg: float = 62.0,
+) -> float | None:
+    """Pinhole-model distance estimate from bounding-box height.
+
+    Uses the known typical height of common COCO objects.
+    Returns None if the class is not in the lookup table.
+    """
+    real_h = _COCO_TYPICAL_HEIGHT_M.get(label.lower())
+    if real_h is None or bbox_h < 5:
+        return None
+    focal_px = (image_width / 2.0) / math.tan(math.radians(hfov_deg / 2.0))
+    return round(real_h * focal_px / bbox_h, 3)
+
+
+def estimate_detection_distance(
+    scan_msg,
+    det: dict,
+    image_width: float = 640.0,
+    image_height: float = 480.0,
+    hfov_deg: float = 62.0,
+) -> dict:
+    """Fuse LiDAR + bbox heuristic for one detection.
+
+    Parameters
+    ----------
+    scan_msg : LaserScan | None
+        Raw LiDAR message (may be None).
+    det : dict
+        Single detection dict with keys: label, confidence, bbox {cx, cy, w, h}.
+    image_width, image_height, hfov_deg : float
+        Camera parameters.
+
+    Returns
+    -------
+    dict with keys:
+        distance_m : float | None
+        distance_source : "lidar" | "bbox_estimate" | "fused" | "none"
+        distance_reliable : bool
+        lidar_m : float | None
+        bbox_estimate_m : float | None
+        lidar_n_rays : int
+    """
+    bbox = det["bbox"]
+    lidar_m = None
+    lidar_n_rays = 0
+    bbox_est = None
+
+    # --- LiDAR-aligned distance ---
+    if scan_msg is not None:
+        lidar_m, lidar_n_rays = lidar_distance_for_bbox(
+            scan_msg, bbox["cx"], bbox["w"], image_width, hfov_deg,
+        )
+
+    # --- Bbox pinhole estimate ---
+    bbox_est = bbox_depth_estimate(
+        bbox["h"], det["label"], image_height, image_width, hfov_deg,
+    )
+
+    # --- Fusion logic ---
+    distance_m = None
+    source = "none"
+    reliable = False
+
+    if lidar_m is not None and bbox_est is not None:
+        # If they broadly agree (within 2× ratio), prefer LiDAR
+        ratio = lidar_m / bbox_est if bbox_est > 0.01 else 999.0
+        if 0.3 < ratio < 3.0:
+            distance_m = lidar_m
+            source = "fused"
+            reliable = True
+        else:
+            # Large disagreement → LiDAR probably hitting background wall,
+            # not the object.  Trust bbox estimate but flag unreliable.
+            distance_m = bbox_est
+            source = "bbox_estimate"
+            reliable = False
+    elif lidar_m is not None:
+        distance_m = lidar_m
+        source = "lidar"
+        reliable = lidar_n_rays >= 3
+    elif bbox_est is not None:
+        distance_m = bbox_est
+        source = "bbox_estimate"
+        reliable = False
+    # else: both None → source stays "none", distance stays None
+
+    return {
+        "distance_m": round(distance_m, 3) if distance_m is not None else None,
+        "distance_source": source,
+        "distance_reliable": reliable,
+        "lidar_m": round(lidar_m, 3) if lidar_m is not None else None,
+        "bbox_estimate_m": round(bbox_est, 3) if bbox_est is not None else None,
+        "lidar_n_rays": lidar_n_rays,
     }
 
 
