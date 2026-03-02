@@ -1,0 +1,23 @@
+[Unit]
+Description=ROS 2 MCP Bridge (FastMCP tool server for robot control)
+Documentation=https://github.com/jedld/ros2_mcp_bridge
+After=network.target time-sync.target orin-cam-web.service orin-detector.service
+Wants=orin-cam-web.service orin-detector.service
+
+[Service]
+User=joseph
+Environment="HOME=/home/joseph"
+Environment="ROS_DOMAIN_ID=42"
+# Source tree is symlinked from the build dir (colcon --symlink-install), so
+# edits to ros2_mcp_bridge/*.py take effect on restart — no rebuild needed.
+ExecStart=/bin/bash -c \
+  "source /opt/ros/humble/setup.bash && \
+   source /home/joseph/turtlebot3_ws/install/setup.bash && \
+   ros2 run ros2_mcp_bridge bridge"
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

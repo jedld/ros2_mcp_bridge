@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import time
+import urllib.request
 from typing import Any, Optional
 
 from fastmcp import FastMCP
@@ -57,13 +58,12 @@ from ros2_mcp_bridge.ros_node import (
     odometry_to_dict,
     detections_to_dict,
     estimate_detection_distance,
-    bearing_from_bbox,
-    motion_stereo_depth,
     sensor_state_to_dict,
     battery_state_to_dict,
     imu_to_dict,
     joint_state_to_dict,
     magnetic_field_to_dict,
+    camera_info_to_dict,
 )
 
 from ros2_mcp_bridge.dsl_runtime import DSLRuntime
@@ -99,8 +99,10 @@ mcp = FastMCP(
     instructions=(
         "Tools for controlling a TurtleBot3 robot via ROS 2.\n"
         "\n"
-        "SENSOR TOOLS: get_camera_image (visual), get_sensor_snapshot (pose+lidar+detections+battery "
-        "all-in-one), get_laser_scan, get_robot_pose, get_detections, get_imu, get_battery_state.\n"
+        "SENSOR TOOLS: get_camera_image (visual), get_full_res_image (high-resolution on-demand capture), "
+        "get_sensor_snapshot (pose+lidar+detections+battery "
+        "all-in-one), get_camera_info (intrinsic matrix, FOV, distortion — use for pixel↔3D math), "
+        "get_laser_scan, get_robot_pose, detect_objects_in_image, get_imu, get_battery_state.\n"
         "\n"
         "MOTION TOOLS: move_distance (precise, odometry-closed-loop), rotate_angle (precise), "
         "move_robot (timed open-loop), stop_robot.\n"
@@ -108,12 +110,7 @@ mcp = FastMCP(
         "NAVIGATION: navigate_to_pose (Nav2), save_waypoint / go_to_waypoint / list_waypoints "
         "(session-level named poses).\n"
         "\n"
-        "SEARCH BEHAVIORS: explore_for_object (drives + searches a room), find_object (rotates in place, "
-        "returns bearing + distance), approach_object (two-phase: acquires bearing+distance via detection "
-        "then switches to blind odometry approach with LiDAR obstacle avoidance — streams progress), "
-        "look_around (360° detection sweep in place), "
-        "panoramic_images (360° image sweep for VLM reasoning), follow_wall (perimeter exploration).\n"
-        "\n"
+
         "VISION SUB-AGENTS (A2A): ask_vision_agent → Qwen3-VL-8B, best for scene description, "
         "object finding, OCR, counting. ask_cosmos_agent → NVIDIA Cosmos-Reason2-8B, best for "
         "navigation safety ('is it safe to move forward?'), obstacle bounding boxes, "
@@ -122,49 +119,18 @@ mcp = FastMCP(
         "MEMORY: set_memory / get_memory / list_memory / clear_memory — persistent scratchpad for "
         "noting observations, plans, and task state between tool calls.\n"
         "\n"
-        "DSL PROGRAMS: For real-time reactive behaviours that need sensor-feedback loops "
-        "faster than MCP round-trip latency allows, write a Python-DSL program using "
-        "dsl_store_program, then run it with dsl_run_program. Programs execute locally on "
-        "the robot at ~20 Hz with access to get_scan(), get_detections(), move(), rotate(), "
-        "stop(), etc. Use dsl_run_inline for one-shot scripts. Manage with dsl_list_programs, "
-        "dsl_get_source, dsl_delete_program, dsl_stop_program.\n"
+        "DSL PROGRAMS: Preferred approach for all search, patrol, approach-object, "
+        "wall-follow, and any multi-step reactive behaviour. Use dsl_run_inline for "
+        "quick one-shot scripts and dsl_store_program + dsl_run_program for reusable "
+        "routines. Programs execute locally at ~20 Hz with access to get_scan(), "
+        "get_detections(), move(), rotate(), stop(), move_distance(), find_object(), "
+        "approach_object(), follow_wall(), navigate_to_pose(), etc. "
+        "Prefer DSL over chaining individual MCP tool calls — it avoids round-trip "
+        "latency and does not incur repeated image/VLM costs. "
+        "Manage stored programs with dsl_list_programs, dsl_get_source, "
+        "dsl_delete_program, dsl_stop_program.\n"
         "\n"
-        "OBJECT DETECTION — COCO-80 CLASS LIMITATION:\n"
-        "The onboard YOLO detector recognises ONLY the 80 COCO classes listed below. "
-        "Tools that take a 'label' parameter (find_object, approach_object, explore_for_object, "
-        "get_detections, look_around) can ONLY match these exact class names:\n"
-        "  person, bicycle, car, motorcycle, airplane, bus, train, truck, boat, traffic light, "
-        "fire hydrant, stop sign, parking meter, bench, bird, cat, dog, horse, sheep, cow, "
-        "elephant, bear, zebra, giraffe, backpack, umbrella, handbag, tie, suitcase, frisbee, "
-        "skis, snowboard, sports ball, kite, baseball bat, baseball glove, skateboard, surfboard, "
-        "tennis racket, bottle, wine glass, cup, fork, knife, spoon, bowl, banana, apple, "
-        "sandwich, orange, broccoli, carrot, hot dog, pizza, donut, cake, chair, couch, "
-        "potted plant, bed, dining table, toilet, tv, laptop, mouse, remote, keyboard, "
-        "cell phone, microwave, oven, toaster, sink, refrigerator, book, clock, vase, "
-        "scissors, teddy bear, hair drier, toothbrush.\n"
-        "\n"
-        "When the user asks for an object that is NOT one of these 80 classes, follow this strategy:\n"
-        "  1. MAP to the closest COCO class if a reasonable equivalent exists. Examples:\n"
-        "     • 'mug' or 'coffee cup' → 'cup'\n"
-        "     • 'sofa' or 'loveseat' → 'couch'\n"
-        "     • 'monitor' or 'screen' or 'television' → 'tv'\n"
-        "     • 'phone' or 'smartphone' or 'iphone' → 'cell phone'\n"
-        "     • 'flower pot' or 'plant' → 'potted plant'\n"
-        "     • 'puppy' or 'hound' → 'dog'\n"
-        "     • 'kitten' → 'cat'\n"
-        "     • 'ball' or 'basketball' or 'soccer ball' → 'sports ball'\n"
-        "     • 'bag' or 'purse' → 'handbag'\n"
-        "     • 'notebook' or 'textbook' → 'book'\n"
-        "     Tell the user which COCO class you are using as a proxy.\n"
-        "  2. FALL BACK TO VLM if there is no reasonable COCO equivalent. Use "
-        "ask_vision_agent or panoramic_images to visually search for the object instead. "
-        "For example, 'shoe', 'pen', 'glasses', 'wallet', 'keys' have no COCO match — "
-        "use the VLM to scan the camera image and locate them.\n"
-        "  3. COMBINE both strategies when useful: use the YOLO detector to quickly narrow "
-        "the search area (e.g. find a 'dining table' first), then use ask_vision_agent to "
-        "look for the specific non-COCO object on/near it (e.g. 'keys on the table').\n"
-        "\n"
-        "STRATEGY: prefer explore_for_object over repeated find_object calls. Use get_sensor_snapshot "
+        "STRATEGY: Use get_sensor_snapshot "
         "instead of calling get_camera_image + get_laser_scan + get_robot_pose separately. "
         "Save interesting locations with save_waypoint so you can return to them. "
         "Use set_memory to record what rooms/areas have been checked. "
@@ -283,42 +249,198 @@ def get_robot_pose(timeout: float = 2.0) -> str:
 
 
 @mcp.tool(
-    title="Get Object Detections",
+    title="Get Camera Info",
     description=(
-        "Return the latest object detections from the vision pipeline. "
-        "Each detection includes a class label, confidence score, bounding "
-        "box in image coordinates, and a fused distance estimate. "
-        "Distance is computed by aligning the detection bbox to specific "
-        "LiDAR rays and cross-validating with a pinhole-model depth "
-        "estimate from the bbox height. If the object is below the 2D "
-        "LiDAR scan plane (e.g. on the floor), the bbox estimate is used "
-        "as fallback and distance_reliable will be false. "
-        "NOTE: the detector only recognises the 80 COCO classes — see the "
-        "server instructions for the full list. If you need to find an "
-        "object outside those classes, use ask_vision_agent instead."
+        "Return the camera's intrinsic calibration parameters from the "
+        "sensor_msgs/CameraInfo topic (published by the camera driver). "
+        "Includes the full 3×3 pinhole intrinsic matrix K, distortion "
+        "coefficients D, projection matrix P, image dimensions, and derived "
+        "horizontal/vertical field-of-view angles. "
+        "Use these parameters for camera-space ↔ physical-space calculations:\n"
+        "  Pixel → 3-D ray: X = (u - cx) / fx,  Y = (v - cy) / fy,  Z = 1\n"
+        "  3-D → pixel:     u = fx * X/Z + cx,   v = fy * Y/Z + cy\n"
+        "If CameraInfo is not being published, estimated values are derived "
+        "from the bridge configuration (image_width, camera_hfov_deg) and "
+        "returned with calibration_source='config_estimate'."
     ),
 )
-def get_detections(timeout: float = 2.0) -> str:
+def get_camera_info(timeout: float = 2.0) -> str:
     """
     Args:
-        timeout: Seconds to wait for a detection message (default 2.0).
+        timeout: Seconds to wait for a CameraInfo message (default 2.0).
+                 CameraInfo is latched so it usually arrives immediately.
     """
     cfg_topics = _node._cfg.get("topics", {})
-    topic = cfg_topics.get("detections", {}).get("topic", "/detections")
+    topic = cfg_topics.get("camera_info", {}).get("topic", "/camera/camera_info")
     msg = _node.get_latest(topic, timeout=timeout)
-    if msg is None:
-        return json.dumps({"error": f"No detections received on {topic} within {timeout}s."})
 
-    result = detections_to_dict(msg)
+    if msg is not None:
+        result = camera_info_to_dict(msg)
+        result["calibration_source"] = "camera_info_topic"
+        result["topic"] = topic
+    else:
+        # Fall back to bridge config estimates using the pinhole model
+        w = int(_node._cfg.get("image_width", 640))
+        hfov_deg = float(_node._cfg.get("camera_hfov_deg", 62.0))
+        hfov_rad = math.radians(hfov_deg)
+        fx = round((w / 2.0) / math.tan(hfov_rad / 2.0), 4)
+        # Assume square pixels and a 4:3 aspect ratio for fy/cy
+        h = int(w * 3 / 4)
+        fy = fx  # square-pixel assumption
+        cx = round(w / 2.0, 4)
+        cy = round(h / 2.0, 4)
+        vfov_deg = round(math.degrees(2.0 * math.atan2(h / 2.0, fy)), 2)
+        K = [fx, 0.0, cx,
+             0.0, fy, cy,
+             0.0, 0.0, 1.0]
+        result = {
+            "image_width":  w,
+            "image_height": h,
+            "distortion_model": "plumb_bob",
+            "K":  [round(v, 4) for v in K],
+            "fx": fx,
+            "fy": fy,
+            "cx": cx,
+            "cy": cy,
+            "D":  [0.0, 0.0, 0.0, 0.0, 0.0],
+            "P":  [fx, 0.0, cx, 0.0,
+                   0.0, fy, cy, 0.0,
+                   0.0, 0.0, 1.0, 0.0],
+            "R":  [1.0, 0.0, 0.0,
+                   0.0, 1.0, 0.0,
+                   0.0, 0.0, 1.0],
+            "hfov_deg": round(hfov_deg, 2),
+            "vfov_deg": vfov_deg,
+            "calibration_source": "config_estimate",
+            "note": (
+                f"No CameraInfo received on {topic}. "
+                "Values derived from bridge.yaml camera_hfov_deg and image_width. "
+                "Run camera calibration and ensure the camera driver publishes "
+                f"sensor_msgs/CameraInfo on {topic} for accurate results."
+            ),
+        }
 
-    # Enrich each detection with fused distance estimate
+    # Always append the bridge-level config values for reference
+    result["bridge_config"] = {
+        "image_width":    _node._cfg.get("image_width", 640),
+        "camera_hfov_deg": float(_node._cfg.get("camera_hfov_deg", 62.0)),
+        "lidar_height_m": float(_node._cfg.get("lidar_height_m", 0.13)),
+    }
+    return json.dumps(result)
+
+
+@mcp.tool(
+    title="Get Full Resolution Image",
+    description=(
+        "Request an on-demand full-resolution JPEG image from the Pi camera. "
+        "Unlike get_camera_image (which returns a compressed live stream frame at "
+        "reduced resolution), this calls the /camera/capture_full_res ROS 2 service "
+        "on the robot's Raspberry Pi and returns the highest-quality image the camera "
+        "can produce. "
+        "Use this when fine detail, text recognition, or high-quality vision analysis "
+        "is required. The capture takes 1-3 seconds. "
+        "IMPORTANT: The full-resolution image is intended for LOCAL processing only "
+        "(e.g. passing to detect_objects_in_image or saving to disk). "
+        "Do NOT send it directly to a VLM / vision-language model or to any external "
+        "internet service — use get_camera_image for that purpose instead, as it "
+        "provides a suitably sized frame for visual inference. "
+        "Returns an MCP Image (JPEG) on success, or an error JSON string on failure."
+    ),
+)
+def get_full_res_image(
+    width: int = 0,
+    height: int = 0,
+    jpeg_quality: int = 90,
+    timeout: float = 20.0,
+) -> Image | str:
+    """
+    Args:
+        width:        Desired image width in pixels. 0 = camera native resolution.
+        height:       Desired image height in pixels. 0 = camera native resolution.
+        jpeg_quality: JPEG compression quality 1-100 (default 90).
+        timeout:      Seconds to wait for the capture service (default 20).
+
+    Returns:
+        Image: MCP ImageContent with the full-resolution JPEG.
+        str:   JSON error string if the capture failed.
+    """
+    result = _node.capture_full_res(
+        width=width,
+        height=height,
+        jpeg_quality=jpeg_quality,
+        timeout=timeout,
+    )
+    if result.get("status") != "succeeded":
+        return json.dumps({"error": result.get("message", "Capture failed.")})
+
+    try:
+        jpeg_bytes = base64.b64decode(result["jpeg_b64"])
+    except Exception as exc:
+        return json.dumps({"error": f"Failed to decode captured image: {exc}"})
+
+    return Image(data=jpeg_bytes, format="jpeg")
+
+
+@mcp.tool(
+    title="Detect Objects in Image",
+    description=(
+        "Run YOLO object detection on a JPEG image and return detected objects "
+        "with class labels, confidence scores, bounding boxes in image coordinates, "
+        "and a fused LiDAR distance estimate for each detection. "
+        "If jpeg_b64 is omitted the latest camera frame is captured automatically. "
+        "Distance is computed by aligning the detection bbox to specific LiDAR rays "
+        "and cross-validating with a pinhole-model depth estimate from the bbox height. "
+        "If the object is below the 2D LiDAR scan plane (e.g. on the floor), the "
+        "bbox estimate is used as fallback and distance_reliable will be false."
+    ),
+)
+def detect_objects_in_image(jpeg_b64: str = "", timeout: float = 3.0) -> str:
+    """
+    Args:
+        jpeg_b64: Base64-encoded JPEG image to run detection on.
+                  Leave empty to automatically capture the current camera frame.
+        timeout:  Seconds to wait for a camera frame when jpeg_b64 is empty (default 3.0).
+    """
+    # ── Resolve JPEG bytes ────────────────────────────────────────────────
+    if jpeg_b64:
+        try:
+            jpeg_bytes = base64.b64decode(jpeg_b64)
+        except Exception as exc:
+            return json.dumps({"error": f"Invalid base64 input: {exc}"})
+    else:
+        cfg_topics = _node._cfg.get("topics", {})
+        topic = cfg_topics.get("camera", {}).get("topic", "/camera/image_raw/compressed")
+        msg = _node.get_latest(topic, timeout=timeout)
+        if msg is None:
+            return json.dumps({"error": f"No camera frame on {topic} within {timeout}s."})
+        jpeg_bytes = bytes(msg.data)
+
+    # ── Call the detector HTTP service ────────────────────────────────────
+    detector_url = _node._cfg.get("detector_service_url", "http://localhost:8082/detect")
+    req = urllib.request.Request(
+        detector_url,
+        data=jpeg_bytes,
+        method="POST",
+        headers={"Content-Type": "image/jpeg"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15.0) as resp:
+            result = json.loads(resp.read())
+    except Exception as exc:
+        return json.dumps({"error": f"Detector service unreachable at {detector_url}: {exc}"})
+
+    if "error" in result:
+        return json.dumps(result)
+
+    # ── Enrich each detection with fused LiDAR distance ──────────────────
+    cfg_topics = _node._cfg.get("topics", {})
     laser_topic = cfg_topics.get("laser", {}).get("topic", "/scan")
     scan_msg = _node.get_latest(laser_topic, timeout=0.5)
     image_width = _node._cfg.get("image_width", 640)
     image_height = int(image_width * 480 / 640)
     hfov_deg = float(_node._cfg.get("camera_hfov_deg", 62.0))
 
-    for det in result["detections"]:
+    for det in result.get("detections", []):
         dist = estimate_detection_distance(
             scan_msg, det, image_width, image_height, hfov_deg,
         )
@@ -427,6 +549,7 @@ def move_robot(
                              Set to False to override (use with caution).
     """
     duration = max(0.1, min(float(duration), 10.0))  # clamp 0.1–10 s
+    _node.clear_stop_event()  # clear any prior stop/cancel before starting fresh motion
 
     ca_global = _node._cfg.get("collision_avoidance", {}).get("enabled", True)
 
@@ -454,18 +577,12 @@ def move_robot(
 
 @mcp.tool(
     title="Stop Robot",
-    description=(
-        "Immediately stop the robot by publishing a zero-velocity command. "
-        "This also cancels any running behaviour (explore_for_object, "
-        "approach_object, find_object, follow_wall, etc.) — the behaviour "
-        "will terminate at the next checkpoint and return a 'cancelled' status. "
-        "Call this whenever you need the robot to halt immediately."
-    ),
+    description="Immediately stop the robot by publishing a zero-velocity command.",
 )
 def stop_robot() -> str:
-    """Stop all robot motion and cancel running behaviours."""
+    """Stop all robot motion."""
     _node.stop()
-    return json.dumps({"status": "stopped", "message": "Robot stopped and running behaviours cancelled."})
+    return json.dumps({"status": "stopped"})
 
 
 @mcp.tool(
@@ -498,6 +615,7 @@ def move_distance(
     """
     ca_global = _node._cfg.get("collision_avoidance", {}).get("enabled", True)
     effective_ca = collision_avoidance and ca_global
+    _node.clear_stop_event()  # clear any prior stop/cancel before starting fresh motion
     result = _node.move_distance(distance, speed, timeout, effective_ca)
     return json.dumps(result)
 
@@ -525,6 +643,7 @@ def rotate_angle(
         speed: Angular speed in rad/s (default 0 = 50% of max_angular_speed).
         timeout: Maximum seconds to spend rotating (default 20).
     """
+    _node.clear_stop_event()  # clear any prior stop/cancel before starting fresh motion
     result = _node.rotate_angle(angle, speed, timeout)
     return json.dumps(result)
 
@@ -945,276 +1064,6 @@ def clear_memory(key: str = "") -> str:
     return json.dumps({"status": "deleted", "key": key})
 
 
-
-# --------------------------------------------------------------------------- #
-# Behavioural tools (higher-level)
-# --------------------------------------------------------------------------- #
-
-
-@mcp.tool(
-    title="Find Object",
-    description=(
-        "Rotate in place (one full circle) while watching for a specific object class. "
-        "IMPORTANT: this tool does NOT move the robot to a new location — it only spins "
-        "on the spot. If the object is not found, you MUST physically drive the robot to "
-        "a new area before calling find_object again, or use explore_for_object instead "
-        "(which automatically moves the robot to new positions). "
-        "When the object IS found, returns its detection plus bearing_deg (angular offset "
-        "from camera centre) and estimated_distance_m (fused LiDAR + bbox estimate) so "
-        "you can then call approach_object to drive to it. "
-        "Collision avoidance (LiDAR) is checked at the start and reported in the "
-        "response if any sectors are obstructed. "
-        "IMPORTANT: the 'label' must be one of the 80 COCO class names (see server "
-        "instructions). Map synonyms to the closest COCO class (e.g. 'mug' → 'cup'). "
-        "If the object has no COCO equivalent, use ask_vision_agent or panoramic_images "
-        "with a VLM query instead."
-    ),
-)
-def find_object(
-    label: str,
-    timeout: float = 20.0,
-    collision_avoidance: bool = True,
-) -> str:
-    """
-    Args:
-        label: Object class label to search for (e.g. 'person', 'bottle').
-        timeout: Maximum seconds to spend rotating (default 20).
-        collision_avoidance: If True (default), report nearby obstacles detected
-                             by LiDAR in the response.
-    """
-    from ros2_mcp_bridge.behaviors import find_object_behavior
-    ca_global = _node._cfg.get("collision_avoidance", {}).get("enabled", True)
-    effective_ca = collision_avoidance and ca_global
-    return json.dumps(find_object_behavior(_node, label, timeout, effective_ca))
-
-
-@mcp.tool(
-    title="Approach Object",
-    description=(
-        "Two-phase approach to a detected object. "
-        "\n\n"
-        "**Phase 1 — Acquisition** (uses YOLO detection): locks on the target's "
-        "bearing from the bounding-box centre, then estimates distance using a "
-        "priority cascade: (1) LiDAR rays aligned with the bearing, (2) pinhole-model "
-        "bbox height estimate, (3) motion-stereo depth fallback (nudges the robot "
-        "~8 cm forward, matches ORB features, triangulates from parallax). "
-        "\n\n"
-        "**Phase 2 — Blind approach** (no more object detection): rotates to face "
-        "the target, then drives forward using odometry closed-loop with LiDAR "
-        "obstacle avoidance, in small increments. Does NOT rely on YOLO during the "
-        "drive — this avoids motion-blur detection failures. "
-        "\n\n"
-        "Returns streaming progress updates: acquisition status, rotation, and "
-        "per-step driving progress so you can monitor the approach in real time. "
-        "The final update has phase='complete'. "
-        "IMPORTANT: the 'label' must be one of the 80 COCO class names (see server "
-        "instructions). The object must already be visible in the current detections."
-    ),
-)
-def approach_object(
-    label: str,
-    stop_distance: float = 0.5,
-    timeout: float = 30.0,
-    collision_avoidance: bool = True,
-) -> str:
-    """
-    Args:
-        label: Object class label to approach (must be currently visible).
-        stop_distance: Desired stop distance from object in metres (default 0.5).
-        timeout: Maximum seconds for the full approach (default 30).
-        collision_avoidance: If True (default), apply LiDAR safety stops during the
-                             blind approach phase if an obstacle enters the minimum
-                             front distance.
-    """
-    from ros2_mcp_bridge.behaviors import approach_object_behavior
-    ca_global = _node._cfg.get("collision_avoidance", {}).get("enabled", True)
-    effective_ca = collision_avoidance and ca_global
-    def generator():
-        for progress in approach_object_behavior(_node, label, stop_distance, timeout, effective_ca):
-            yield json.dumps(progress)
-    return generator()
-
-
-@mcp.tool(
-    title="Look Around",
-    description=(
-        "Rotate the robot in a full circle, pausing at evenly-spaced headings "
-        "to capture a camera image and detection snapshot at each stop. "
-        "Returns a list of observations (detections per heading). "
-        "NOTE: like find_object, this tool only rotates in place; it does not "
-        "move the robot to a new location. Use explore_for_object if you need "
-        "the robot to actively drive around and search a larger area. "
-        "When collision_avoidance is enabled, each observation includes the "
-        "current LiDAR sector distances so the LLM can reason about nearby obstacles."
-    ),
-)
-def look_around(
-    n_stops: int = 8,
-    pause_s: float = 1.0,
-    collision_avoidance: bool = True,
-) -> str:
-    """
-    Args:
-        n_stops: Number of evenly-spaced headings to sample (default 8 = 45° apart).
-        pause_s: Seconds to pause at each heading before capturing (default 1.0).
-        collision_avoidance: If True (default), include LiDAR obstacle distances
-                             in each observation snapshot.
-    """
-    from ros2_mcp_bridge.behaviors import look_around_behavior
-    ca_global = _node._cfg.get("collision_avoidance", {}).get("enabled", True)
-    effective_ca = collision_avoidance and ca_global
-    return json.dumps(look_around_behavior(_node, n_stops, pause_s, effective_ca))
-
-
-@mcp.tool(
-    title="Explore For Object",
-    description=(
-        "Actively explore the environment to find a specific object class. "
-        "Unlike find_object or look_around (which only rotate in place), this tool "
-        "physically moves the robot to new positions while searching. "
-        "At each position it performs a full 360° detection sweep; if the target is "
-        "not found it reads LiDAR to choose the most-open direction, then drives "
-        "forward step_distance metres and repeats. "
-        "Use this when find_object has already failed at the current location, or "
-        "when the task requires searching a room or larger area. "
-        "Returns found status, the detection details if found, steps taken, and "
-        "an exploration path log. "
-        "When collision_avoidance is enabled (default), the robot will not drive "
-        "into obstacles and will attempt to navigate around them. "
-        "IMPORTANT: the 'label' must be one of the 80 COCO class names (see server "
-        "instructions). Map synonyms to the closest COCO class (e.g. 'sofa' → 'couch'). "
-        "If the object has no COCO equivalent, combine exploration with "
-        "ask_vision_agent to visually locate it."
-    ),
-)
-def explore_for_object(
-    label: str,
-    step_distance: float = 0.5,
-    max_steps: int = 10,
-    timeout: float = 180.0,
-    collision_avoidance: bool = True,
-) -> str:
-    """
-    Args:
-        label: Object class label to search for (e.g. 'shoe', 'bottle', 'person').
-        step_distance: How far to drive between scan positions in metres (default 0.5).
-                       Increase for large rooms; decrease for small cluttered spaces.
-        max_steps: Maximum number of drive-forward steps before giving up (default 10).
-        timeout: Maximum total seconds for the entire exploration (default 180).
-        collision_avoidance: If True (default), use LiDAR to avoid obstacles while
-                             navigating between scan positions.
-    """
-    from ros2_mcp_bridge.behaviors import explore_for_object_behavior
-    ca_global = _node._cfg.get("collision_avoidance", {}).get("enabled", True)
-    effective_ca = collision_avoidance and ca_global
-    def generator():
-        for progress in explore_for_object_behavior(_node, label, step_distance, max_steps, timeout, effective_ca):
-            yield json.dumps(progress)
-    return generator()
-
-
-@mcp.tool(
-    title="Panoramic Images",
-    description=(
-        "Rotate the robot in a full circle, capture a camera image at each of "
-        "n_stops evenly-spaced headings, and return all frames together. "
-        "This lets a vision-language model reason about the entire 360° scene in "
-        "one tool call rather than issuing many separate get_camera_image calls. "
-        "Useful for: initial room survey, verifying 'shoe not visible anywhere', "
-        "choosing which direction to explore next. "
-        "Each image is returned as an MCP ImageContent so the VLM can inspect it directly. "
-        "A JSON summary of detections at each heading is appended as the last content item."
-    ),
-)
-def panoramic_images(
-    n_stops: int = 6,
-    pause_s: float = 0.8,
-) -> list:
-    """
-    Args:
-        n_stops: Number of evenly-spaced headings to photograph (default 6 = every 60°).
-        pause_s: Seconds to pause at each stop before capturing (default 0.8).
-    """
-    import math as _math
-
-    cfg_topics = _node._cfg.get("topics", {})
-    cam_topic = cfg_topics.get("camera", {}).get("topic", "/camera/image_raw/compressed")
-    det_topic = cfg_topics.get("detections", {}).get("topic", "/detections")
-
-    step_rad   = (2 * _math.pi) / n_stops
-    ang_speed  = 0.6  # rad/s
-    step_time  = step_rad / ang_speed
-
-    content = []
-    summary = []
-
-    for i in range(n_stops):
-        heading_deg = round(_math.degrees(i * step_rad) % 360, 1)
-
-        # Rotate one step
-        deadline = time.time() + step_time
-        while time.time() < deadline:
-            _node.publish_twist(0.0, ang_speed)
-            time.sleep(0.05)
-        _node.stop()
-        time.sleep(pause_s)
-
-        # Capture image → MCP ImageContent
-        cam_msg = _node.get_latest(cam_topic, timeout=1.5)
-        if cam_msg is not None:
-            fmt = (cam_msg.format or "jpeg").lower().split("/")[-1]
-            content.append(Image(data=bytes(cam_msg.data), format=fmt))
-        else:
-            content.append(json.dumps({"heading_deg": heading_deg, "error": "no_image"}))
-
-        # Capture detections for summary
-        det_msg = _node.get_latest(det_topic, timeout=0.5)
-        dets = detections_to_dict(det_msg)["detections"] if det_msg is not None else []
-        summary.append({"heading_deg": heading_deg, "detections": dets})
-
-    # Append JSON summary as the last content item
-    content.append(json.dumps({
-        "panorama_summary": summary,
-        "total_unique_labels": list({d["label"] for obs in summary for d in obs["detections"]}),
-    }))
-    return content
-
-
-@mcp.tool(
-    title="Follow Wall",
-    description=(
-        "Drive along a wall, maintaining a set distance from it, for a specified duration. "
-        "This is a classic exploration primitive for mapping room perimeters: "
-        "the robot hugs one wall and moves forward until it hits a corner or obstacle. "
-        "Use side='left' to follow the left wall, side='right' for the right wall. "
-        "Stops early if a front obstacle is detected (collision avoidance). "
-        "Combine with rotate_angle (turn at corners) to circuit an entire room."
-    ),
-)
-def follow_wall(
-    side: str = "left",
-    target_distance: float = 0.35,
-    duration: float = 10.0,
-    speed: float = 0.0,
-) -> str:
-    """
-    Args:
-        side: Which wall to track — 'left' or 'right' (default 'left').
-        target_distance: Desired distance from the wall in metres (default 0.35).
-        duration: How long to follow for in seconds (default 10, max 120).
-        speed: Forward speed in m/s (default 0 = 60% of max_linear_speed).
-    """
-    if side not in ("left", "right"):
-        return json.dumps({"error": "side must be 'left' or 'right'."})
-    duration = max(1.0, min(float(duration), 120.0))
-    rob_cfg  = _node._cfg.get("robot", {})
-    if speed == 0.0:
-        speed = float(rob_cfg.get("max_linear_speed", 0.22)) * 0.6
-    from ros2_mcp_bridge.behaviors import follow_wall_behavior
-    result = follow_wall_behavior(_node, side, target_distance, duration, speed)
-    return json.dumps(result)
-
-
 # --------------------------------------------------------------------------- #
 # A2A VLM sub-agent
 # --------------------------------------------------------------------------- #
@@ -1438,7 +1287,6 @@ def _dsl_result_to_dict(r) -> dict:
         "BEHAVIORS: find_object(label, timeout_s=20) — rotate searching for object, returns {found, detection}, "
         "approach_object(label, stop_distance=0.5, timeout_s=30) — drive toward detected object, "
         "follow_wall(side='left', target_distance=0.35, duration_s=10) — follow a wall, "
-        "explore_for_object(label, step_distance=0.5, max_steps=10, timeout_s=180) — explore to find object\n"
         "\n"
         "MEMORY: get_memory(key) → value or None, set_memory(key, value, description='') — "
         "shared with the LLM scratchpad tools, list_memory() → {key: value}, "

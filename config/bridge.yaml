@@ -32,13 +32,51 @@ ros2_mcp_bridge:
 
   # Horizontal field of view of the camera (degrees).
   # Used to map detection bounding-box pixel positions to LiDAR angles
-  # and for pinhole-model depth estimation.  Typical webcams: 55–70°.
-  camera_hfov_deg: 62.0
+  # and for pinhole-model depth estimation.
+  # This value is used as a fallback when /camera/camera_info is not available.
+  # Camera Module 3 Wide @ 640x480: fx=346, fy=363 → hfov=85.53°, vfov=66.94°
+  # Note: non-square pixels (fx≠fy); bridge uses HFOV (horizontal axis) only.
+  # D coefficients are all-zero — full distortion calibration recommended.
+  camera_hfov_deg: 85.5
 
   # Height of the 2D LiDAR scan plane above ground (metres).
   # Objects whose top is below this height generate no LiDAR return;
   # the bridge uses a bbox-based depth estimate as fallback.
   lidar_height_m: 0.13
+
+  # URL of the orin_cam_web detector HTTP service (POST /detect).
+  # Accepts raw JPEG bytes; returns {"count": N, "detections": [...]}.
+  # The detect_objects_in_image MCP tool calls this endpoint.
+  # Default: co-located on the same host as the bridge.
+  detector_service_url: http://localhost:8082/detect
+
+  # ── Depth estimation & floor analysis service ─────────────────────────── #
+  # Standalone HTTP service running Depth Anything V2 (ViT-Small) on the GPU.
+  # Start with: python3 -m orin_cam_web.depth_service --port 8083
+  # Or with TRT engine:
+  #   python3 -m orin_cam_web.depth_service \
+  #       --engine /path/to/depth_anything_v2_small.engine
+  #
+  # Provides:
+  #   GET  /health          — health check, returns backend name
+  #   POST /depth           — monocular depth map (relative inv-depth)
+  #   POST /depth/metric    — depth anchored to LiDAR front distance
+  #   POST /depth/two_frame — two-image metric depth via optical-flow triangulation
+  #   POST /floor           — floor region line/anomaly/spill detection
+  #
+  # Set enabled: false to disable all depth/floor MCP tools.
+  depth_service:
+    enabled: true
+    url: http://localhost:8083
+    # Optional: path to pre-built TRT FP16 engine for ~3-5x faster inference.
+    # Build once on the Jetson — see instructions at the top of depth_service.py.
+    # engine: /home/joseph/turtlebot3_ws/camera_streamer/depth_anything_v2_small.engine
+
+  # ── Floor analysis tuning ─────────────────────────────────────────────── #
+  floor_analysis:
+    # Fraction of image height treated as the floor crop (bottom N%).
+    # At robot camera height (~20 cm), 30% captures floor ~0.2-0.8 m ahead.
+    floor_fraction: 0.30
 
   # ── Approach object tuning ─────────────────────────────────────────────── #
   # Controls approach_object behaviour — tune these to match your detector
@@ -80,6 +118,13 @@ ros2_mcp_bridge:
     camera:
       topic: /camera/image_raw/compressed
       type: sensor_msgs/CompressedImage
+
+    # Camera intrinsics (latched; published once on startup).
+    # Used by get_camera_info to expose the pinhole model and distortion
+    # coefficients for camera-space ↔ physical-space calculations.
+    camera_info:
+      topic: /camera/camera_info
+      type: sensor_msgs/CameraInfo
 
     laser:
       topic: /scan
@@ -146,7 +191,7 @@ ros2_mcp_bridge:
   # The VLM agent only needs a vision-capable model endpoint (vLLM, Ollama,
   # OpenRouter etc.) and the onit PromptsMCPServer on the same host.
   vlm_agent:
-    enabled: false
+    enabled: true
     url: http://localhost:9002   # A2A server URL (onit --a2a --config configs/vlm_agent.yaml)
     # timeout is controlled per-call via ask_vision_agent's timeout parameter
 

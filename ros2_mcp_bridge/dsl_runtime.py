@@ -251,6 +251,7 @@ class DSLRuntime:
                     error="Another DSL program is already running. Stop it first.",
                 )
             self._stop_event.clear()
+            self._node.clear_stop_event()  # clear node-level stop so DSL motion starts clean
             self._current_name = prog.name
 
         log_lines: list[str] = []
@@ -526,16 +527,16 @@ class DSLRuntime:
             return follow_wall_behavior(node, side, target_distance,
                                         min(duration_s, timeout), speed)
 
-        def explore_for_object(label: str, step_distance: float = 0.5,
-                               max_steps: int = 10, timeout_s: float = 180.0,
-                               collision_avoidance: bool = True) -> dict:
-            """Explore the environment to find an object. Returns {found, path, ...}."""
-            _guard()
-            from ros2_mcp_bridge.behaviors import explore_for_object_behavior
-            ca = collision_avoidance and ca_global
-            return explore_for_object_behavior(node, label, step_distance,
-                                               max_steps,
-                                               min(timeout_s, timeout), ca)
+        # def explore_for_object(label: str, step_distance: float = 0.5,
+        #                        max_steps: int = 10, timeout_s: float = 180.0,
+        #                        collision_avoidance: bool = True) -> dict:
+        #     """Explore the environment to find an object. Returns {found, path, ...}."""
+        #     _guard()
+        #     from ros2_mcp_bridge.behaviors import explore_for_object_behavior
+        #     ca = collision_avoidance and ca_global
+        #     return explore_for_object_behavior(node, label, step_distance,
+        #                                        max_steps,
+        #                                        min(timeout_s, timeout), ca)
 
         # ── memory functions ───────────────────────────────────────────── #
         mem = self._memory

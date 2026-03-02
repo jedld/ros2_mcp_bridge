@@ -24,7 +24,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy
 
 from geometry_msgs.msg import Twist
-from sensor_msgs.msg import CompressedImage, Imu, JointState, LaserScan, BatteryState, MagneticField
+from sensor_msgs.msg import CompressedImage, CameraInfo, Imu, JointState, LaserScan, BatteryState, MagneticField
 from nav_msgs.msg import Odometry
 from vision_msgs.msg import Detection2DArray
 
@@ -697,6 +697,92 @@ class ROS2BridgeNode(Node):
                 "message": result.message}
 
     # ------------------------------------------------------------------ #
+    # Full-resolution image capture (Pi camera service)
+    # ------------------------------------------------------------------ #
+
+    def capture_full_res(
+        self,
+        width: int = 0,
+        height: int = 0,
+        jpeg_quality: int = 90,
+        timeout: float = 20.0,
+    ) -> dict:
+        """
+        Call the /camera/capture_full_res service on the Pi to capture a
+        full-resolution image on demand.
+
+        Args:
+            width:        Requested image width in pixels (0 = camera native).
+            height:       Requested image height in pixels (0 = camera native).
+            jpeg_quality: JPEG compression quality 1-100 (default 90).
+            timeout:      Maximum seconds to wait for the service (default 20).
+
+        Returns:
+            On success::
+                {
+                    "status": "succeeded",
+                    "width": int,
+                    "height": int,
+                    "jpeg_b64": str,   # base-64 encoded JPEG bytes
+                    "message": str,
+                }
+            On failure::
+                {"status": "failed", "message": str}
+        """
+        try:
+            from turtlebot3_camera_interfaces.srv import CaptureImage
+        except ImportError:
+            return {
+                "status": "failed",
+                "message": (
+                    "turtlebot3_camera_interfaces not installed. "
+                    "Build the package and source the workspace."
+                ),
+            }
+
+        client = self.create_client(CaptureImage, "/camera/capture_full_res")
+        if not client.wait_for_service(timeout_sec=min(timeout, 10.0)):
+            return {
+                "status": "failed",
+                "message": (
+                    "/camera/capture_full_res service not available. "
+                    "Ensure the camera node is running on the robot."
+                ),
+            }
+
+        req = CaptureImage.Request()
+        req.width = int(width)
+        req.height = int(height)
+        req.jpeg_quality = int(max(1, min(100, jpeg_quality)))
+
+        future = client.call_async(req)
+        deadline = time.time() + timeout
+        while not future.done() and time.time() < deadline:
+            time.sleep(0.05)
+
+        if not future.done():
+            return {"status": "failed", "message": "capture_full_res service call timed out."}
+
+        result = future.result()
+        if not result.success:
+            return {"status": "failed", "message": result.message or "Capture failed."}
+
+        jpeg_bytes = bytes(result.image.data)
+        jpeg_b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+
+        # Extract actual dimensions from the image header if available
+        actual_w = getattr(result.image, "width", width) or width
+        actual_h = getattr(result.image, "height", height) or height
+
+        return {
+            "status": "succeeded",
+            "width": actual_w,
+            "height": actual_h,
+            "jpeg_b64": jpeg_b64,
+            "message": result.message or "Image captured.",
+        }
+
+    # ------------------------------------------------------------------ #
     # Nav2 action client (lazy)
     # ------------------------------------------------------------------ #
 
@@ -762,6 +848,7 @@ class ROS2BridgeNode(Node):
 # --------------------------------------------------------------------------- #
 
 _MSG_TYPE_MAP = {
+    "sensor_msgs/CameraInfo":        CameraInfo,
     "sensor_msgs/CompressedImage":   CompressedImage,
     "sensor_msgs/Imu":               Imu,
     "sensor_msgs/JointState":        JointState,
@@ -1270,4 +1357,66 @@ def magnetic_field_to_dict(msg) -> dict:
         "z_T": round(f.z, 9),
         "magnitude_T": round(magnitude, 9),
         "magnitude_uT": round(magnitude * 1e6, 3),
+    }
+
+
+def camera_info_to_dict(msg: CameraInfo) -> dict:
+    """Serialise sensor_msgs/CameraInfo to a plain dict.
+
+    Returns the full pinhole-model intrinsic matrix K, distortion
+    coefficients D, projection matrix P, image dimensions, and derived
+    convenience values (hfov_deg, vfov_deg, fx, fy, cx, cy) so that the
+    LLM can perform 3D ↔ pixel projection without additional lookups.
+
+    Projection of a 3-D point (X, Y, Z) in camera frame to pixel (u, v):
+        u = fx * X/Z + cx
+        v = fy * Y/Z + cy
+
+    Back-projection of pixel (u, v) at known depth Z:
+        X = (u - cx) * Z / fx
+        Y = (v - cy) * Z / fy
+    """
+    K = list(msg.k)           # 3×3 row-major intrinsic matrix
+    D = list(msg.d)           # distortion coefficients
+    P = list(msg.p)           # 3×4 projection matrix (for rectified images)
+    R = list(msg.r)           # 3×3 rectification rotation
+
+    fx = K[0] if len(K) >= 1 else None
+    fy = K[4] if len(K) >= 5 else None
+    cx = K[2] if len(K) >= 3 else None
+    cy = K[5] if len(K) >= 6 else None
+
+    w = msg.width
+    h = msg.height
+
+    # Derive field-of-view angles from intrinsics when available
+    hfov_deg = None
+    vfov_deg = None
+    if fx and w:
+        hfov_deg = round(math.degrees(2.0 * math.atan2(w / 2.0, fx)), 2)
+    if fy and h:
+        vfov_deg = round(math.degrees(2.0 * math.atan2(h / 2.0, fy)), 2)
+
+    return {
+        "image_width":  w,
+        "image_height": h,
+        "distortion_model": msg.distortion_model,
+        # Pinhole intrinsic matrix K (3×3, row-major)
+        # [ fx  0  cx ]
+        # [  0 fy  cy ]
+        # [  0  0   1 ]
+        "K": K,
+        "fx": round(fx, 4) if fx is not None else None,
+        "fy": round(fy, 4) if fy is not None else None,
+        "cx": round(cx, 4) if cx is not None else None,
+        "cy": round(cy, 4) if cy is not None else None,
+        # Distortion coefficients D  (plumb_bob: k1,k2,p1,p2[,k3])
+        "D": [round(d, 8) for d in D],
+        # Projection matrix P (3×4) for rectified images: P = K [R | t]
+        "P": [round(p, 4) for p in P],
+        # Rectification rotation R (identity for mono cameras)
+        "R": [round(r, 8) for r in R],
+        # Derived convenience values
+        "hfov_deg": hfov_deg,
+        "vfov_deg": vfov_deg,
     }

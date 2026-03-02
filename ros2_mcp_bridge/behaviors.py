@@ -29,29 +29,16 @@ def find_object_behavior(
     Rotate in place up to one full revolution while watching for *label*.
     Returns {"found": bool, "detection": <dict or None>, "heading_deg": float}.
 
-    When the object is found, this also computes:
-      - **bearing_deg**: the angular offset of the object from the camera
-        centre (positive = left).
-      - **estimated_distance_m** / **distance_source**: fused LiDAR + bbox
-        depth estimate so the LLM can decide whether to approach directly.
-
     When *collision_avoidance* is True an initial LiDAR snapshot is taken and
     its sector distances are included in the return dict so the LLM can reason
     about the surrounding space.  Pure rotation does not change the robot's
     position so forward/rear collision checks are not applied here.
     """
-    from ros2_mcp_bridge.ros_node import (
-        detections_to_dict, laser_scan_to_dict,
-        estimate_detection_distance, bearing_from_bbox,
-    )
+    from ros2_mcp_bridge.ros_node import detections_to_dict, laser_scan_to_dict
 
     cfg = node._cfg.get("topics", {})
     det_topic = cfg.get("detections", {}).get("topic", "/detections")
     laser_topic = cfg.get("laser", {}).get("topic", "/scan")
-
-    image_width = node._cfg.get("image_width", 640)
-    image_height = int(image_width * 480 / 640)
-    hfov_deg = float(node._cfg.get("camera_hfov_deg", 62.0))
 
     # Snapshot obstacle distances before we start spinning
     obstacle_info: dict | None = None
@@ -74,26 +61,10 @@ def find_object_behavior(
     full_circle_time = (2 * math.pi) / angular_speed
     deadline = time.time() + min(timeout, full_circle_time * 1.05)
 
-    # Clear any previous stop signal so the loop runs cleanly
-    node.clear_stop_event()
-
     heading_rad = 0.0
     last_det = None
 
     while time.time() < deadline:
-        if node.is_stop_requested():
-            node.stop()
-            result = {
-                "found": False,
-                "label": label,
-                "detection": None,
-                "heading_deg": None,
-                "cancelled": True,
-                "message": "Search cancelled by stop command.",
-            }
-            if obstacle_info is not None:
-                result["obstacle_distances_m"] = obstacle_info
-            return result
         node.publish_twist(0.0, angular_speed)
         time.sleep(poll_interval)
         heading_rad += angular_speed * poll_interval
@@ -104,27 +75,11 @@ def find_object_behavior(
             for det in d["detections"]:
                 if det["label"].lower() == label.lower():
                     node.stop()
-
-                    # Compute bearing from bbox centre
-                    bearing_rad = bearing_from_bbox(
-                        det["bbox"]["cx"], image_width, hfov_deg,
-                    )
-                    bearing_deg_val = round(math.degrees(bearing_rad), 1)
-
-                    # Estimate distance using LiDAR + bbox cascade
-                    scan_now = node.get_latest(laser_topic, timeout=0.3)
-                    dist_info = estimate_detection_distance(
-                        scan_now, det, image_width, image_height, hfov_deg,
-                    )
-
                     result = {
                         "found": True,
                         "label": label,
                         "detection": det,
                         "heading_deg": round(math.degrees(heading_rad) % 360, 1),
-                        "bearing_deg": bearing_deg_val,
-                        "estimated_distance_m": dist_info["distance_m"],
-                        "distance_source": dist_info["distance_source"],
                     }
                     if obstacle_info is not None:
                         result["obstacle_distances_m"] = obstacle_info
@@ -246,7 +201,7 @@ def _vlm_check_object(node: "ROS2BridgeNode", label: str, cam_topic: str,
 
 
 # --------------------------------------------------------------------------- #
-# approach_object  (two-phase: acquire → blind approach)
+# approach_object
 # --------------------------------------------------------------------------- #
 
 def approach_object_behavior(
@@ -257,383 +212,231 @@ def approach_object_behavior(
     collision_avoidance: bool = True,
 ) -> dict:
     """
-    Two-phase approach to a detected object.
+    Drive toward *label* until within *stop_distance* metres.
 
-    **Phase 1 — Acquisition** (uses object detection):
-      1. Get a fresh YOLO detection for *label*.
-      2. Compute bearing angle from the bounding-box centre in the image.
-      3. Estimate distance using a priority cascade:
-         a. LiDAR rays aligned with the bearing (most reliable).
-         b. Pinhole-model bbox height estimate (works for known COCO classes).
-         c. Motion-stereo depth fallback: nudge the robot forward ~8 cm,
-            match ORB features in the bbox region, triangulate depth from
-            parallax, then reverse back.
-      4. Convert (bearing, distance) into a target point in the odometry frame.
+    Key robustness improvements over a naive get-and-drive loop:
 
-    **Phase 2 — Blind approach** (no more object detection):
-      1. Rotate to face the target bearing.
-      2. Compute the drive distance = estimated_distance − stop_distance.
-      3. Drive forward in small increments using odometry closed-loop,
-         with LiDAR collision avoidance at every step.
-      4. Yield streaming progress updates so the LLM can track movement.
-      5. Stop when the target distance is reached or an obstacle blocks.
+    1. **Frame synchronization** — uses ``get_fresh()`` for detections so
+       the behaviour always acts on the newest detector output, not a stale
+       cached message from before the robot moved.
 
-    The generator yields dicts with status updates; the final yield has
-    ``"phase": "complete"``.
+    2. **Stop-and-rescan on lost detection** — when YOLO loses the target
+       (common during motion blur), the robot *stops*, waits for the camera
+       to capture a sharp frame, and retries detection several times before
+       declaring the target lost.  This avoids triggering an unnecessary
+       360° find_object scan when the object is right in front of the robot.
+
+    3. **Adaptive speed** — the robot decelerates as it nears the target,
+       reducing motion blur and giving the detector more time to lock on.
+
+    4. **VLM fallback** — if YOLO keeps failing after retries and a VLM
+       agent is enabled, the behaviour captures a clean frame and asks the
+       VLM whether the object is still visible.  If the VLM confirms, the
+       robot continues cautiously using LiDAR-only distance guidance.
+
+    5. **Collision avoidance** — unchanged: a hard LiDAR safety stop fires
+       if any obstacle enters the configured minimum front distance.
     """
     from ros2_mcp_bridge.ros_node import (
         detections_to_dict, laser_scan_to_dict,
-        estimate_detection_distance, bearing_from_bbox,
-        motion_stereo_depth, odometry_to_dict,
+        estimate_detection_distance,
     )
 
     cfg = node._cfg.get("topics", {})
     det_topic = cfg.get("detections", {}).get("topic", "/detections")
     scan_topic = cfg.get("laser", {}).get("topic", "/scan")
     cam_topic = cfg.get("camera", {}).get("topic", "/camera/image_raw/compressed")
-    odom_topic = cfg.get("odom", {}).get("topic", "/odom")
 
     ca_cfg = node._cfg.get("collision_avoidance", {})
     min_front_ca = float(ca_cfg.get("min_front_distance", 0.30))
 
+    # Camera / image parameters for distance estimation
     image_width = node._cfg.get("image_width", 640)
-    image_height = int(image_width * 480 / 640)
+    image_height = int(image_width * 480 / 640)  # assume 4:3 aspect
     hfov_deg = float(node._cfg.get("camera_hfov_deg", 62.0))
 
+    # ── Approach tuning (bridge.yaml → approach_object section) ───────── #
     approach_cfg = node._cfg.get("approach_object", {})
     max_speed = float(approach_cfg.get("max_speed", 0.15))
     min_speed = float(approach_cfg.get("min_speed", 0.05))
-    step_size = float(approach_cfg.get("step_size", 0.15))
+    slow_distance = float(approach_cfg.get("slow_distance", 0.8))
+    lost_retries = int(approach_cfg.get("lost_retries", 5))
+    rescan_pause = float(approach_cfg.get("rescan_pause", 0.4))
+    vlm_fallback_enabled = bool(approach_cfg.get("vlm_fallback", True))
 
     deadline = time.time() + timeout
+    consecutive_lost = 0
+    vlm_used = False
 
-    # Clear any previous stop signal so the generator runs cleanly
-    node.clear_stop_event()
+    while time.time() < deadline:
+        # ── Get FRESH detection (not stale cache) ────────────────────── #
+        det_msg = node.get_fresh(det_topic, timeout=0.5)
+        scan_msg = node.get_latest(scan_topic, timeout=0.3)
 
-    # ================================================================== #
-    #  PHASE 1 — ACQUISITION  (detection-based)
-    # ================================================================== #
-
-    yield {
-        "phase": "acquisition",
-        "status": "detecting",
-        "message": f"Searching for '{label}' in current camera frame...",
-    }
-
-    # --- 1a. Get fresh detection ---------------------------------------- #
-    det_msg = None
-    target = None
-    DETECT_RETRIES = 5
-    for attempt in range(DETECT_RETRIES):
-        if time.time() >= deadline or node.is_stop_requested():
+        if det_msg is None:
             node.stop()
-            yield {"phase": "complete", "status": "cancelled" if node.is_stop_requested() else "timeout",
-                   "message": "Cancelled by stop command." if node.is_stop_requested() else "Timed out during acquisition phase."}
-            return
-        det_msg = node.get_fresh(det_topic, timeout=1.0)
-        if det_msg is not None:
-            d = detections_to_dict(det_msg)
-            target = next(
-                (x for x in d["detections"]
-                 if x["label"].lower() == label.lower()),
-                None,
-            )
-        if target is not None:
-            break
-        time.sleep(0.3)
+            return {"status": "lost_target", "message": "No detections received.",
+                    "collision_avoidance_activated": False}
 
-    if target is None:
-        node.stop()
-        yield {
-            "phase": "complete",
-            "status": "not_found",
-            "message": (
-                f"'{label}' not detected after {DETECT_RETRIES} attempts. "
-                f"Try find_object first to rotate toward the object, "
-                f"or explore_for_object to search a larger area."
-            ),
-        }
-        return
-
-    # --- 1b. Compute bearing -------------------------------------------- #
-    bearing_rad = bearing_from_bbox(target["bbox"]["cx"], image_width, hfov_deg)
-    bearing_deg = round(math.degrees(bearing_rad), 1)
-
-    yield {
-        "phase": "acquisition",
-        "status": "bearing_locked",
-        "label": label,
-        "bearing_deg": bearing_deg,
-        "detection": target,
-        "message": f"Locked bearing on '{label}' at {bearing_deg}° from centre.",
-    }
-
-    # --- 1c. Estimate distance (cascade) -------------------------------- #
-    scan_msg = node.get_latest(scan_topic, timeout=0.5)
-
-    dist_info = estimate_detection_distance(
-        scan_msg, target, image_width, image_height, hfov_deg,
-    )
-    est_dist = dist_info["distance_m"]
-    dist_source = dist_info["distance_source"]
-
-    # If both LiDAR and bbox failed, try motion stereo
-    if est_dist is None:
-        yield {
-            "phase": "acquisition",
-            "status": "motion_stereo",
-            "message": (
-                "LiDAR and bbox estimates unavailable. "
-                "Attempting motion-stereo depth estimation (nudging forward ~8 cm)..."
-            ),
-        }
-        stereo_depth = motion_stereo_depth(
-            node, cam_topic, target["bbox"],
-            image_width, hfov_deg, baseline_m=0.08,
+        d = detections_to_dict(det_msg)
+        target = next(
+            (x for x in d["detections"] if x["label"].lower() == label.lower()),
+            None,
         )
-        if stereo_depth is not None:
-            est_dist = stereo_depth
-            dist_source = "motion_stereo"
-        else:
+
+        # ── Stop-and-rescan when target lost (motion blur recovery) ─── #
+        if target is None:
+            consecutive_lost += 1
+
+            if consecutive_lost <= lost_retries:
+                # Stop to eliminate motion blur and let detector see a clean frame
+                node.stop()
+                time.sleep(rescan_pause)
+
+                # Fetch a genuinely new detection after the pause
+                det_msg = node.get_fresh(det_topic, timeout=0.5)
+                if det_msg is not None:
+                    d = detections_to_dict(det_msg)
+                    target = next(
+                        (x for x in d["detections"]
+                         if x["label"].lower() == label.lower()),
+                        None,
+                    )
+                if target is not None:
+                    consecutive_lost = 0
+                    # Fall through to steering logic below
+                else:
+                    continue  # try again on next iteration
+
+            else:
+                # ── VLM fallback ─────────────────────────────────────── #
+                if vlm_fallback_enabled:
+                    vlm_result = _vlm_check_object(node, label, cam_topic)
+                    vlm_used = True
+
+                    if vlm_result is not None and vlm_result.get("visible"):
+                        # VLM sees the object but YOLO doesn't — continue
+                        # cautiously with LiDAR-only distance guidance
+                        if scan_msg is not None:
+                            scan_d = laser_scan_to_dict(scan_msg)
+                            front = scan_d.get("front_min_m")
+
+                            if front is not None and front <= stop_distance:
+                                node.stop()
+                                return {
+                                    "status": "reached",
+                                    "message": (
+                                        f"VLM confirmed '{label}' ahead; "
+                                        f"stopped at {front:.2f} m "
+                                        f"(YOLO lost track, LiDAR + VLM guided stop)."
+                                    ),
+                                    "distance_m": round(front, 3),
+                                    "distance_source": "vlm_lidar",
+                                    "distance_reliable": False,
+                                    "collision_avoidance_activated": False,
+                                    "vlm_assisted": True,
+                                    "vlm_response": vlm_result.get("vlm_response", ""),
+                                }
+
+                            if (collision_avoidance and front is not None
+                                    and front < min_front_ca):
+                                node.stop()
+                                return {
+                                    "status": "blocked",
+                                    "collision_avoidance_activated": True,
+                                    "message": (
+                                        f"VLM confirmed '{label}' but obstacle "
+                                        f"at {front:.2f} m (threshold "
+                                        f"{min_front_ca:.2f} m)."
+                                    ),
+                                    "distance_m": round(front, 3),
+                                    "vlm_assisted": True,
+                                }
+
+                        # VLM sees it — drive forward slowly, allow more retries
+                        node.publish_twist(min_speed, 0.0)
+                        time.sleep(0.15)
+                        consecutive_lost = max(0, lost_retries - 2)
+                        continue
+
+                # All retries (+ VLM if enabled) exhausted — target truly lost
+                node.stop()
+                msg = f"'{label}' not detected after {lost_retries} retries."
+                if vlm_used:
+                    msg += " VLM also could not confirm the object."
+                return {"status": "lost_target",
+                        "message": msg,
+                        "collision_avoidance_activated": False,
+                        "vlm_assisted": vlm_used}
+
+        if target is None:
+            continue
+
+        # ── Object found — reset lost counter ────────────────────────── #
+        consecutive_lost = 0
+
+        # Steering: proportional to horizontal offset from image centre
+        cx = target["bbox"]["cx"]
+        offset = (cx - image_width / 2.0) / (image_width / 2.0)  # [-1, 1]
+        angular_z = -0.5 * offset  # negative because image-x is left→right
+
+        # ── Fused distance estimate (bbox-aligned LiDAR + pinhole) ──── #
+        dist_info = estimate_detection_distance(
+            scan_msg, target, image_width, image_height, hfov_deg,
+        )
+        est_dist = dist_info["distance_m"]
+
+        # Also keep the broad front sector for collision avoidance
+        front_broad = None
+        if scan_msg is not None:
+            scan_d = laser_scan_to_dict(scan_msg)
+            front_broad = scan_d.get("front_min_m")
+
+        # ── Target reached (intentional stop) ────────────────────────── #
+        if est_dist is not None and est_dist <= stop_distance:
             node.stop()
-            yield {
-                "phase": "complete",
-                "status": "distance_unknown",
-                "bearing_deg": bearing_deg,
+            return {
+                "status": "reached",
                 "message": (
-                    f"Could not estimate distance to '{label}'. "
-                    f"LiDAR, bbox, and motion-stereo all failed. "
-                    f"The object may be too small, too far, or featureless. "
-                    f"Try driving closer manually and retrying."
+                    f"Stopped ~{est_dist:.2f} m from '{label}' "
+                    f"(source: {dist_info['distance_source']})."
                 ),
+                "distance_m": round(est_dist, 3),
+                "distance_source": dist_info["distance_source"],
+                "distance_reliable": dist_info["distance_reliable"],
+                "collision_avoidance_activated": False,
             }
-            return
 
-    yield {
-        "phase": "acquisition",
-        "status": "distance_estimated",
-        "estimated_distance_m": round(est_dist, 3),
-        "distance_source": dist_source,
-        "bearing_deg": bearing_deg,
-        "message": (
-            f"Distance to '{label}': {est_dist:.2f} m "
-            f"(source: {dist_source}). "
-            f"Will approach to within {stop_distance:.2f} m."
-        ),
-    }
-
-    # --- 1d. Already within stop distance? ------------------------------ #
-    if est_dist <= stop_distance:
-        node.stop()
-        yield {
-            "phase": "complete",
-            "status": "already_reached",
-            "distance_m": round(est_dist, 3),
-            "distance_source": dist_source,
-            "bearing_deg": bearing_deg,
-            "message": (
-                f"Already within stop distance: {est_dist:.2f} m ≤ {stop_distance:.2f} m. "
-                f"No approach needed."
-            ),
-        }
-        return
-
-    # --- 1e. Compute target pose in odom frame -------------------------- #
-    odom_msg = node.get_latest(odom_topic, timeout=1.0)
-    if odom_msg is None:
-        node.stop()
-        yield {"phase": "complete", "status": "failed",
-               "message": "Odometry not available."}
-        return
-
-    odom = odometry_to_dict(odom_msg)
-    robot_x, robot_y = odom["x"], odom["y"]
-    robot_yaw = odom["yaw_rad"]
-
-    # Target in world frame: robot_pos + distance * direction(yaw + bearing)
-    target_angle = robot_yaw + bearing_rad
-    target_x = robot_x + est_dist * math.cos(target_angle)
-    target_y = robot_y + est_dist * math.sin(target_angle)
-    drive_distance = max(0.0, est_dist - stop_distance)
-
-    yield {
-        "phase": "acquisition",
-        "status": "target_computed",
-        "target_x": round(target_x, 3),
-        "target_y": round(target_y, 3),
-        "drive_distance_m": round(drive_distance, 3),
-        "message": (
-            f"Target pose: ({target_x:.3f}, {target_y:.3f}). "
-            f"Will drive {drive_distance:.2f} m after rotating {bearing_deg:.1f}°."
-        ),
-    }
-
-    # ================================================================== #
-    #  PHASE 2 — BLIND APPROACH  (odometry + LiDAR, no detection)
-    # ================================================================== #
-
-    yield {
-        "phase": "approach",
-        "status": "rotating",
-        "bearing_deg": bearing_deg,
-        "message": f"Rotating {bearing_deg:.1f}° to face '{label}'...",
-    }
-
-    # --- 2a. Rotate to face the target ---------------------------------- #
-    if abs(bearing_deg) > 2.0:
-        rot_result = node.rotate_angle(bearing_deg, 0.0, min(deadline - time.time(), 10.0))
-        if rot_result["status"] == "stuck":
-            yield {
-                "phase": "complete",
-                "status": "stuck_rotating",
-                "rotation_result": rot_result,
-                "message": f"Got stuck while rotating: {rot_result.get('message', '')}",
-            }
-            return
-        yield {
-            "phase": "approach",
-            "status": "rotation_complete",
-            "rotation_result": rot_result,
-            "message": f"Rotation done: {rot_result.get('angle_actual_deg', 0):.1f}° actual.",
-        }
-
-    # --- 2b. Drive forward in increments -------------------------------- #
-    remaining_dist = drive_distance
-    total_driven = 0.0
-    step_num = 0
-
-    while remaining_dist > 0.02 and time.time() < deadline:
-        # --- Check for cancellation --------------------------------- #
-        if node.is_stop_requested():
+        # ── Collision avoidance safety stop (uses broad front sector) ── #
+        if collision_avoidance and front_broad is not None and front_broad < min_front_ca:
             node.stop()
-            yield {
-                "phase": "complete",
-                "status": "cancelled",
-                "distance_driven_m": round(total_driven, 3),
-                "distance_remaining_m": round(remaining_dist, 3),
-                "message": "Approach cancelled by stop command.",
+            return {
+                "status": "blocked",
+                "collision_avoidance_activated": True,
+                "message": (
+                    f"Collision avoidance activated: obstacle {front_broad:.2f} m ahead "
+                    f"(threshold {min_front_ca:.2f} m). Approach aborted."
+                ),
+                "distance_m": round(est_dist, 3) if est_dist is not None else None,
+                "distance_source": dist_info["distance_source"],
+                "distance_reliable": dist_info["distance_reliable"],
             }
-            return
-        step_num += 1
-        this_step = min(step_size, remaining_dist)
 
-        # Adaptive speed: slow down in the last 0.3 m
-        if remaining_dist < 0.3:
-            speed = min_speed + (max_speed - min_speed) * (remaining_dist / 0.3)
+        # ── Adaptive speed: slow down when close to reduce blur ──────── #
+        if est_dist is not None and est_dist < slow_distance:
+            frac = est_dist / slow_distance          # 0.0 → 1.0
+            speed = min_speed + (max_speed - min_speed) * frac
         else:
             speed = max_speed
 
-        # Pre-step collision check via latest LiDAR
-        if collision_avoidance:
-            scan_msg = node.get_latest(scan_topic, timeout=0.3)
-            if scan_msg is not None:
-                s = laser_scan_to_dict(scan_msg)
-                front = s.get("front_min_m")
-                if front is not None and front < min_front_ca:
-                    node.stop()
-                    yield {
-                        "phase": "complete",
-                        "status": "blocked",
-                        "collision_avoidance_activated": True,
-                        "obstacle_distance_m": round(front, 3),
-                        "distance_driven_m": round(total_driven, 3),
-                        "distance_remaining_m": round(remaining_dist, 3),
-                        "message": (
-                            f"Obstacle detected at {front:.2f} m (threshold "
-                            f"{min_front_ca:.2f} m). Stopped after driving "
-                            f"{total_driven:.2f} m of {drive_distance:.2f} m."
-                        ),
-                    }
-                    return
-
-        # Drive one step
-        step_result = node.move_distance(
-            this_step, speed=speed,
-            timeout=min(deadline - time.time(), 10.0),
-            collision_avoidance=collision_avoidance,
-        )
-
-        actual_step = abs(step_result.get("distance_actual", 0.0))
-        total_driven += actual_step
-        remaining_dist -= actual_step
-
-        # Handle blocked / stuck during step
-        if step_result["status"] == "blocked":
-            node.stop()
-            yield {
-                "phase": "complete",
-                "status": "blocked",
-                "collision_avoidance_activated": True,
-                "distance_driven_m": round(total_driven, 3),
-                "distance_remaining_m": round(remaining_dist, 3),
-                "step_result": step_result,
-                "message": (
-                    f"Blocked by obstacle after {total_driven:.2f} m. "
-                    f"{remaining_dist:.2f} m remaining. "
-                    f"Consider trying a different approach angle."
-                ),
-            }
-            return
-
-        if step_result["status"] == "stuck":
-            yield {
-                "phase": "complete",
-                "status": "stuck",
-                "distance_driven_m": round(total_driven, 3),
-                "distance_remaining_m": round(remaining_dist, 3),
-                "step_result": step_result,
-                "message": (
-                    f"Robot stuck after driving {total_driven:.2f} m. "
-                    f"{step_result.get('message', '')}"
-                ),
-            }
-            return
-
-        # Progress update
-        pct = round(total_driven / drive_distance * 100, 0) if drive_distance > 0 else 100
-        yield {
-            "phase": "approach",
-            "status": "driving",
-            "step": step_num,
-            "step_distance_m": round(actual_step, 3),
-            "total_driven_m": round(total_driven, 3),
-            "remaining_m": round(max(0, remaining_dist), 3),
-            "progress_pct": pct,
-            "message": (
-                f"Step {step_num}: drove {actual_step:.3f} m. "
-                f"Total: {total_driven:.2f}/{drive_distance:.2f} m ({pct:.0f}%)."
-            ),
-        }
+        # Drive forward while steering
+        node.publish_twist(speed, angular_z)
+        time.sleep(0.1)
 
     node.stop()
-
-    # --- Final status ---------------------------------------------------- #
-    if remaining_dist <= 0.02:
-        yield {
-            "phase": "complete",
-            "status": "reached",
-            "label": label,
-            "distance_driven_m": round(total_driven, 3),
-            "estimated_final_distance_m": round(stop_distance, 3),
-            "distance_source": dist_source,
-            "bearing_deg": bearing_deg,
-            "message": (
-                f"Approached '{label}' successfully. Drove {total_driven:.2f} m. "
-                f"Estimated distance from object: ~{stop_distance:.2f} m "
-                f"(based on {dist_source} measurement)."
-            ),
-        }
-    else:
-        yield {
-            "phase": "complete",
-            "status": "timeout",
-            "distance_driven_m": round(total_driven, 3),
-            "distance_remaining_m": round(remaining_dist, 3),
-            "message": (
-                f"Approach timed out after {timeout:.0f}s. "
-                f"Drove {total_driven:.2f} m, {remaining_dist:.2f} m remaining."
-            ),
-        }
+    return {"status": "timeout",
+            "message": f"Approach timed out after {timeout}s.",
+            "collision_avoidance_activated": False}
 
 
 # --------------------------------------------------------------------------- #
@@ -755,9 +558,6 @@ def explore_for_object_behavior(
     deadline = time.time() + timeout
     path: list[dict] = []
 
-    # Clear any previous stop signal so the generator runs cleanly
-    node.clear_stop_event()
-
     def _current_pose() -> dict | None:
         msg = node.get_latest(odom_topic, timeout=0.5)
         if msg is None:
@@ -783,17 +583,6 @@ def explore_for_object_behavior(
                 "progress": "timeout",
                 "step": step,
                 "path": path,
-            }
-            return
-
-        # --- Check for cancellation --------------------------------- #
-        if node.is_stop_requested():
-            node.stop()
-            yield {
-                "progress": "cancelled",
-                "step": step,
-                "path": path,
-                "message": "Exploration cancelled by stop command.",
             }
             return
 
@@ -954,18 +743,7 @@ def follow_wall_behavior(
     deadline = time.time() + duration
     start    = time.time()
 
-    # Clear any previous stop signal
-    node.clear_stop_event()
-
     while time.time() < deadline:
-        if node.is_stop_requested():
-            node.stop()
-            return {
-                "status": "cancelled",
-                "message": "Wall-follow cancelled by stop command.",
-                "distance_travelled_m": round(linear_v * (time.time() - start), 2),
-                "duration_s": round(time.time() - start, 2),
-            }
         scan_msg = node.get_latest(laser_topic, timeout=0.3)
 
         if scan_msg is not None:
