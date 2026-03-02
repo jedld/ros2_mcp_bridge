@@ -411,6 +411,20 @@ class ROS2BridgeNode(Node):
         Positive = counter-clockwise (left).  Negative = clockwise (right).
         *speed* is angular velocity (rad/s); 0 = use 50% of max.
         Returns dict with status, angle_requested, angle_actual.
+
+        The rotation uses a three-phase approach to prevent overshoot:
+
+        1. **Cruise** — full speed until a configurable deceleration zone
+           (default 30°) before the target.
+        2. **Deceleration / pulse** — instead of ramping to a low continuous
+           speed (which the firmware's dead-zone compensation boosts to
+           a high duty anyway), the robot uses short motor pulses separated
+           by coast+measure gaps.  This gives the firmware no chance to
+           apply sustained dead-zone thrust.
+        3. **Coast+verify** — after each pulse (or when the target is
+           nearly reached) the motors are stopped and odometry is polled
+           for ~200 ms to account for rotational inertia before deciding
+           whether more rotation is needed.
         """
         if speed <= 0:
             speed = self._max_angular_speed * 0.5
@@ -429,11 +443,50 @@ class ROS2BridgeNode(Node):
         rotated = 0.0
         prev_yaw = start[2]
 
+        # ── Tuning knobs ──────────────────────────────────────────────── #
+        # Deceleration zone: start pulsing this far from the target.
+        DECEL_ZONE_RAD = math.radians(30)
+        # Early stop: stop motors this far before the target to allow
+        # coasting/inertia to cover the remaining distance.
+        EARLY_STOP_RAD = math.radians(5)
+        # Pulse mode: in the decel zone, drive for PULSE_ON then coast
+        # for PULSE_OFF to measure actual position.
+        PULSE_ON_S   = 0.10   # 100 ms motor pulse
+        PULSE_OFF_S  = 0.20   # 200 ms coast/measure gap
+        # Coast settle: after final stop, wait this long and re-measure.
+        COAST_SETTLE_S = 0.35
+
         # Stuck detection for rotation: wheel drag / carpet / obstacle
         _STUCK_YAW_THRESH = 0.002    # rad per 20 Hz loop ≈ 0.04 rad/s effective
         _STUCK_CMD_THRESH = 0.25     # only flag if cmd ≥ this rad/s (ignore slow ramp)
         _STUCK_MAX_COUNT  = 20       # 20 × 50 ms = 1.0 s of zero angular progress
         stuck_count = 0
+
+        def _read_yaw_delta() -> float:
+            """Read odom and accumulate rotation. Returns the delta."""
+            nonlocal rotated, prev_yaw
+            cur = self._get_odom_pose()
+            if cur is None:
+                return 0.0
+            d_yaw = cur[2] - prev_yaw
+            if d_yaw > math.pi:
+                d_yaw -= 2 * math.pi
+            elif d_yaw < -math.pi:
+                d_yaw += 2 * math.pi
+            rotated += abs(d_yaw)
+            prev_yaw = cur[2]
+            return abs(d_yaw)
+
+        def _coast_and_settle(settle_s: float):
+            """Stop motors and spin odom for settle_s to catch inertia."""
+            self._cmd_pub.publish(Twist())
+            t_end = time.time() + settle_s
+            while time.time() < t_end:
+                time.sleep(period)
+                _read_yaw_delta()
+
+        # ── Main rotation loop ────────────────────────────────────────── #
+        in_pulse_mode = False
 
         while rotated < target_rad and time.time() < deadline:
             if self._stop_event.is_set():
@@ -445,33 +498,42 @@ class ROS2BridgeNode(Node):
                     "angle_actual_deg": round(actual_deg, 2),
                     "message": "Rotation cancelled by stop command.",
                 }
+
             remaining = target_rad - rotated
-            # Slow down in the last 10 degrees
-            if remaining < math.radians(10):
-                cmd_speed = max(0.15, speed * (remaining / math.radians(10)))
-            else:
-                cmd_speed = speed
+
+            # ── Phase: early stop for coasting ─────────────────────── #
+            if remaining < EARLY_STOP_RAD:
+                _coast_and_settle(COAST_SETTLE_S)
+                break  # good enough — inertia will cover the rest
+
+            # ── Phase: pulse mode (deceleration zone) ──────────────── #
+            if remaining < DECEL_ZONE_RAD:
+                if not in_pulse_mode:
+                    in_pulse_mode = True
+
+                # Short burst
+                pulse_speed = max(0.15, speed * 0.35)
+                t_end = time.time() + PULSE_ON_S
+                while time.time() < t_end and rotated < (target_rad - EARLY_STOP_RAD):
+                    self.publish_twist(0.0, direction * pulse_speed)
+                    time.sleep(period)
+                    _read_yaw_delta()
+
+                # Coast + measure
+                _coast_and_settle(PULSE_OFF_S)
+                continue
+
+            # ── Phase: cruise (full speed) ─────────────────────────── #
+            cmd_speed = speed
             self.publish_twist(0.0, direction * cmd_speed)
             time.sleep(period)
+            d_yaw = _read_yaw_delta()
 
-            cur = self._get_odom_pose()
-            if cur is None:
-                continue
-            # Signed angular delta, taking wraparound into account
-            d_yaw = cur[2] - prev_yaw
-            if d_yaw > math.pi:
-                d_yaw -= 2 * math.pi
-            elif d_yaw < -math.pi:
-                d_yaw += 2 * math.pi
-            rotated += abs(d_yaw)
-            prev_yaw = cur[2]
-
-            # Stuck detection
-            if cmd_speed >= _STUCK_CMD_THRESH and abs(d_yaw) < _STUCK_YAW_THRESH:
+            # Stuck detection (only during cruise)
+            if cmd_speed >= _STUCK_CMD_THRESH and d_yaw < _STUCK_YAW_THRESH:
                 stuck_count += 1
                 if stuck_count >= _STUCK_MAX_COUNT:
                     self.stop()
-                    # Best recovery for rotation stall: short linear reverse
                     rev = self.move_distance(
                         -0.10,
                         speed=self._max_linear_speed * 0.4,
@@ -496,7 +558,9 @@ class ROS2BridgeNode(Node):
             else:
                 stuck_count = 0
 
-        self.stop()
+        # ── Final coast settle ────────────────────────────────────────── #
+        self._cmd_pub.publish(Twist())
+        _coast_and_settle(COAST_SETTLE_S)
 
         timed_out = rotated < target_rad * 0.9
         actual_deg = math.degrees(rotated) * direction
