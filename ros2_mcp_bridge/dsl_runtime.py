@@ -735,6 +735,15 @@ class DSLRuntime:
         #                                        max_steps,
         #                                        min(timeout_s, timeout), ca)
 
+        def explore_for_object(label: str, step_distance: float = 0.5,
+                               max_steps: int = 10, timeout_s: float = 180.0,
+                               collision_avoidance: bool = True) -> dict:
+            """Explore the environment searching for an object (not yet fully implemented)."""
+            _guard()
+            log(f"explore_for_object('{label}') is not yet fully implemented; "
+                "falling back to find_object.")
+            return find_object(label, min(timeout_s, timeout), collision_avoidance)
+
         # ── memory functions ───────────────────────────────────────────── #
         mem = self._memory
 
