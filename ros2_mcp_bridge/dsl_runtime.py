@@ -18,6 +18,7 @@ Design principles:
    via exception/timeout/cancellation).
 """
 
+import ast
 import copy
 import logging
 import math
@@ -180,6 +181,167 @@ class DSLRuntime:
                 "default_params": p.default_params,
             }
 
+    def validate_source(self, source: str) -> dict:
+        """Static-check DSL source without executing it.
+
+        Performs:
+          1. Python syntax check (with line/column info)
+          2. Forbidden-statement detection (import, open, eval, exec, …)
+          3. Undefined-name warnings for common DSL typos
+
+        Returns::
+            {
+              "ok": bool,
+              "errors": [{"type", "message", "line"}, ...],
+              "warnings": [{"type", "message", "line"}, ...],
+            }
+        """
+        errors: list[dict] = []
+        warnings: list[dict] = []
+
+        # 1. Syntax check ------------------------------------------------
+        try:
+            tree = ast.parse(source, "<dsl:validate>")
+        except SyntaxError as e:
+            return {
+                "ok": False,
+                "errors": [{
+                    "type": "SyntaxError",
+                    "message": str(e.msg),
+                    "line": e.lineno,
+                    "col": e.offset,
+                    "text": (e.text or "").rstrip(),
+                }],
+                "warnings": [],
+            }
+
+        # 2. Forbidden / dangerous patterns --------------------------------
+        _FORBIDDEN_CALLS = frozenset({
+            "open", "eval", "exec", "__import__", "compile",
+            "breakpoint", "input",
+        })
+        # Names available in the DSL namespace (for undefined-name check)
+        _KNOWN_NAMES = frozenset({
+            "params", "dry_run",
+            # sensors
+            "get_scan", "get_odom", "get_detections", "get_imu",
+            "get_battery", "get_image",
+            # motion
+            "move", "stop", "move_distance", "rotate", "check_collision",
+            # navigation
+            "navigate_to_pose", "save_waypoint", "go_to_waypoint",
+            "list_waypoints",
+            # behaviors
+            "find_object", "approach_object", "follow_wall",
+            "explore_for_object",
+            # memory
+            "get_memory", "set_memory", "list_memory", "delete_memory",
+            # control
+            "sleep", "log", "elapsed", "set_result", "time",
+            # math
+            "math", "pi", "sqrt", "atan2", "sin", "cos",
+            "radians", "degrees",
+            # opencv
+            "cv_gray", "cv_resize", "cv_blur", "cv_canny",
+            "cv_hsv_filter", "cv_find_contours", "cv_largest_blob",
+            "cv_hough_lines", "cv_detect_aruco", "cv_image_stats",
+            "cv_encode_jpg", "cv_draw_boxes",
+            # safe builtins
+            "True", "False", "None",
+            "abs", "all", "any", "bool", "dict", "enumerate", "filter",
+            "float", "int", "isinstance", "len", "list", "map", "max",
+            "min", "print", "range", "reversed", "round", "set",
+            "sorted", "str", "sum", "tuple", "type", "zip",
+        })
+
+        # Collect all names assigned (defined) in the top-level scope
+        _assigned: set[str] = set()
+        for node_item in ast.walk(tree):
+            if isinstance(node_item, (ast.Assign, ast.AugAssign)):
+                targets = (
+                    node_item.targets
+                    if isinstance(node_item, ast.Assign)
+                    else [node_item.target]
+                )
+                for t in targets:
+                    if isinstance(t, ast.Name):
+                        _assigned.add(t.id)
+            elif isinstance(node_item, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                        ast.ClassDef)):
+                _assigned.add(node_item.name)
+            elif isinstance(node_item, ast.For):
+                if isinstance(node_item.target, ast.Name):
+                    _assigned.add(node_item.target.id)
+            elif isinstance(node_item, ast.NamedExpr):
+                if isinstance(node_item.target, ast.Name):
+                    _assigned.add(node_item.target.id)
+
+        _all_known = _KNOWN_NAMES | _assigned
+
+        for node_item in ast.walk(tree):
+            lineno = getattr(node_item, "lineno", None)
+
+            # Forbidden: import statements
+            if isinstance(node_item, (ast.Import, ast.ImportFrom)):
+                errors.append({
+                    "type": "ForbiddenStatement",
+                    "message": (
+                        "import statements are not allowed in DSL programs. "
+                        "All needed modules are pre-imported."
+                    ),
+                    "line": lineno,
+                })
+
+            # Forbidden: dangerous calls
+            elif isinstance(node_item, ast.Call):
+                func = node_item.func
+                name_id = (
+                    func.id if isinstance(func, ast.Name)
+                    else func.attr if isinstance(func, ast.Attribute)
+                    else None
+                )
+                if name_id in _FORBIDDEN_CALLS:
+                    errors.append({
+                        "type": "ForbiddenCall",
+                        "message": (
+                            f"'{name_id}()' is not available in the DSL sandbox."
+                        ),
+                        "line": lineno,
+                    })
+
+            # Warning: __dunder__ attribute access (likely to fail)
+            elif isinstance(node_item, ast.Attribute):
+                if (node_item.attr.startswith("__")
+                        and node_item.attr.endswith("__")):
+                    warnings.append({
+                        "type": "DunderAccess",
+                        "message": (
+                            f"Accessing dunder attribute '{node_item.attr}' "
+                            "is likely to fail in the sandbox."
+                        ),
+                        "line": lineno,
+                    })
+
+            # Warning: Name used as load that is not in the known set
+            elif isinstance(node_item, ast.Name):
+                if (isinstance(node_item.ctx, ast.Load)
+                        and node_item.id not in _all_known
+                        and not node_item.id.startswith("_")):
+                    warnings.append({
+                        "type": "PossiblyUndefined",
+                        "message": (
+                            f"'{node_item.id}' is not a built-in DSL name. "
+                            "Ensure it is assigned before use."
+                        ),
+                        "line": lineno,
+                    })
+
+        return {
+            "ok": len(errors) == 0,
+            "errors": errors,
+            "warnings": warnings,
+        }
+
     # ------------------------------------------------------------------ #
     # Public API — execution
     # ------------------------------------------------------------------ #
@@ -187,6 +349,7 @@ class DSLRuntime:
     def run_program(
         self, name: str, params: dict | None = None,
         timeout: float | None = None,
+        dry_run: bool = False,
     ) -> DSLRunResult:
         """Execute a stored DSL program synchronously (blocks until done)."""
         if not self._enabled:
@@ -200,11 +363,12 @@ class DSLRuntime:
 
         merged_params = {**prog.default_params, **(params or {})}
         timeout = min(float(timeout or self._default_timeout), self._max_timeout)
-        return self._execute(prog, merged_params, timeout)
+        return self._execute(prog, merged_params, timeout, dry_run=dry_run)
 
     def run_inline(
         self, source: str, params: dict | None = None,
         timeout: float | None = None,
+        dry_run: bool = False,
     ) -> DSLRunResult:
         """Compile and execute DSL source directly (not stored)."""
         if not self._enabled:
@@ -217,7 +381,7 @@ class DSLRuntime:
                                 error=f"Syntax error: {e}")
         prog = DSLProgram(name="<inline>", source=source)
         timeout = min(float(timeout or self._default_timeout), self._max_timeout)
-        return self._execute(prog, params or {}, timeout)
+        return self._execute(prog, params or {}, timeout, dry_run=dry_run)
 
     def stop_running(self) -> dict:
         """Request the currently running DSL program to stop."""
@@ -241,6 +405,7 @@ class DSLRuntime:
 
     def _execute(
         self, prog: DSLProgram, params: dict, timeout: float,
+        dry_run: bool = False,
     ) -> DSLRunResult:
         """Run a DSLProgram, blocking the caller until it finishes."""
         # Only one program at a time
@@ -260,7 +425,8 @@ class DSLRuntime:
         def _target():
             start = time.time()
             try:
-                ns = self._build_namespace(params, log_lines, timeout, start)
+                ns = self._build_namespace(params, log_lines, timeout, start,
+                                           dry_run=dry_run)
                 code = compile(prog.source, f"<dsl:{prog.name}>", "exec")
                 exec(code, ns)  # noqa: S102
                 ret = ns.get("__result__")
@@ -276,14 +442,31 @@ class DSLRuntime:
                     duration_s=round(time.time() - start, 3),
                 ))
             except Exception as e:
+                # Build a clean traceback pointing at the DSL source lines
+                full_tb = traceback.format_exc()
+                tb_lines = full_tb.splitlines()
+                # Keep only frames that reference the user's DSL file
+                dsl_frames: list[str] = []
+                collect = False
+                for ln in tb_lines:
+                    if "<dsl:" in ln:
+                        collect = True
+                    if collect:
+                        dsl_frames.append(ln)
+                error_detail = (
+                    "\n".join(dsl_frames)
+                    if dsl_frames
+                    else f"{type(e).__name__}: {e}"
+                )
                 result_holder.append(DSLRunResult(
                     name=prog.name, status="error",
-                    log=log_lines, error=f"{type(e).__name__}: {e}",
+                    log=log_lines, error=error_detail,
                     duration_s=round(time.time() - start, 3),
                 ))
             finally:
                 try:
-                    self._node.stop()
+                    if not dry_run:
+                        self._node.stop()
                 except Exception:
                     pass
 
@@ -332,6 +515,7 @@ class DSLRuntime:
     def _build_namespace(
         self, params: dict, log_lines: list[str],
         timeout: float, start_time: float,
+        dry_run: bool = False,
     ) -> dict:
         """Build the restricted global namespace for DSL execution."""
         node = self._node
@@ -413,6 +597,19 @@ class DSLRuntime:
             if msg is None:
                 return None
             return battery_state_to_dict(msg)
+
+        def get_image(timeout_s: float = 0.5):
+            """Get the latest camera frame as a BGR numpy array, or None if unavailable."""
+            _guard()
+            import cv2 as _cv2
+            import numpy as _np
+            topic = cfg_topics.get("camera", {}).get(
+                "topic", "/camera/image_raw/compressed")
+            msg = node.get_latest(topic, timeout=timeout_s)
+            if msg is None:
+                return None
+            arr = _np.frombuffer(bytes(msg.data), dtype=_np.uint8)
+            return _cv2.imdecode(arr, _cv2.IMREAD_COLOR)
 
         # ── motion functions ─────────────────────────────────────────── #
         collision_cfg = cfg.get("collision_avoidance", {})
@@ -589,6 +786,243 @@ class DSLRuntime:
             """Set the return value of the program."""
             ns["__result__"] = value
 
+        # ── opencv utilities ─────────────────────────────────────────── #
+        # All cv_* functions require get_image() or a numpy array from it.
+        def cv_gray(img):
+            """Convert a BGR image to grayscale."""
+            import cv2 as _cv2
+            return _cv2.cvtColor(img, _cv2.COLOR_BGR2GRAY)
+
+        def cv_resize(img, width: int, height: int):
+            """Resize image to (width, height) pixels."""
+            import cv2 as _cv2
+            return _cv2.resize(img, (int(width), int(height)))
+
+        def cv_blur(img, kernel_size: int = 5):
+            """Apply Gaussian blur. kernel_size must be odd (auto-corrected)."""
+            import cv2 as _cv2
+            k = int(kernel_size)
+            if k % 2 == 0:
+                k += 1
+            return _cv2.GaussianBlur(img, (k, k), 0)
+
+        def cv_canny(img, low: float = 50.0, high: float = 150.0):
+            """Canny edge detection. Works on BGR or grayscale images."""
+            import cv2 as _cv2
+            gray = img if len(img.shape) == 2 else _cv2.cvtColor(img, _cv2.COLOR_BGR2GRAY)
+            return _cv2.Canny(gray, low, high)
+
+        def cv_hsv_filter(img, lower: list, upper: list):
+            """
+            Return a binary mask where pixels fall within the HSV range.
+            lower/upper are [H, S, V].  H ∈ [0,179], S/V ∈ [0,255].
+            Example: red ≈ lower=[0,120,70], upper=[10,255,255].
+            """
+            import cv2 as _cv2
+            import numpy as _np
+            hsv = _cv2.cvtColor(img, _cv2.COLOR_BGR2HSV)
+            return _cv2.inRange(
+                hsv,
+                _np.array(lower, dtype=_np.uint8),
+                _np.array(upper, dtype=_np.uint8),
+            )
+
+        def cv_find_contours(mask, min_area: float = 100.0) -> list:
+            """
+            Find contours in a binary mask.
+            Returns [{area, cx, cy, x, y, w, h}, ...] sorted by area descending.
+            """
+            import cv2 as _cv2
+            contours, _ = _cv2.findContours(
+                mask, _cv2.RETR_EXTERNAL, _cv2.CHAIN_APPROX_SIMPLE)
+            result = []
+            for c in contours:
+                area = _cv2.contourArea(c)
+                if area < min_area:
+                    continue
+                x, y, w, h = _cv2.boundingRect(c)
+                M = _cv2.moments(c)
+                cx = int(M["m10"] / M["m00"]) if M["m00"] != 0 else x + w // 2
+                cy = int(M["m01"] / M["m00"]) if M["m00"] != 0 else y + h // 2
+                result.append({
+                    "area": float(area), "cx": cx, "cy": cy,
+                    "x": x, "y": y, "w": w, "h": h,
+                })
+            return sorted(result, key=lambda c: c["area"], reverse=True)
+
+        def cv_largest_blob(mask) -> dict | None:
+            """
+            Return the largest connected blob in a binary mask as
+            {cx, cy, area, x, y, w, h}, or None if no blob found.
+            """
+            blobs = cv_find_contours(mask, min_area=1)
+            return blobs[0] if blobs else None
+
+        def cv_hough_lines(edges, threshold: int = 50,
+                           min_length: float = 30.0,
+                           max_gap: float = 10.0) -> list:
+            """
+            Probabilistic Hough line detection on a Canny edge image.
+            Returns [{x1,y1,x2,y2,length,angle_deg}, ...].
+            """
+            import cv2 as _cv2
+            import numpy as _np
+            lines = _cv2.HoughLinesP(
+                edges, 1, _np.pi / 180, int(threshold),
+                minLineLength=min_length, maxLineGap=max_gap,
+            )
+            if lines is None:
+                return []
+            result = []
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                length = float(_np.hypot(x2 - x1, y2 - y1))
+                angle = float(_np.degrees(_np.arctan2(y2 - y1, x2 - x1)))
+                result.append({
+                    "x1": int(x1), "y1": int(y1),
+                    "x2": int(x2), "y2": int(y2),
+                    "length": round(length, 1),
+                    "angle_deg": round(angle, 1),
+                })
+            return result
+
+        def cv_detect_aruco(img, dict_type: str = "DICT_4X4_50") -> list:
+            """
+            Detect ArUco markers in a BGR image.
+            Returns [{id, corners, cx, cy}, ...].
+            dict_type options: DICT_4X4_50, DICT_4X4_100, DICT_5X5_50, DICT_6X6_50.
+            """
+            import cv2 as _cv2
+            _dict_map = {
+                "DICT_4X4_50":  _cv2.aruco.DICT_4X4_50,
+                "DICT_4X4_100": _cv2.aruco.DICT_4X4_100,
+                "DICT_5X5_50":  _cv2.aruco.DICT_5X5_50,
+                "DICT_6X6_50":  _cv2.aruco.DICT_6X6_50,
+            }
+            aruco_dict = _cv2.aruco.getPredefinedDictionary(
+                _dict_map.get(dict_type, _cv2.aruco.DICT_4X4_50))
+            detector = _cv2.aruco.ArucoDetector(
+                aruco_dict, _cv2.aruco.DetectorParameters())
+            corners, ids, _ = detector.detectMarkers(img)
+            if ids is None:
+                return []
+            result = []
+            for i, corner in enumerate(corners):
+                pts = corner[0]
+                cx = float(pts[:, 0].mean())
+                cy = float(pts[:, 1].mean())
+                result.append({
+                    "id": int(ids[i][0]),
+                    "corners": pts.tolist(),
+                    "cx": round(cx, 1),
+                    "cy": round(cy, 1),
+                })
+            return result
+
+        def cv_image_stats(img) -> dict:
+            """Return {height, width, channels, mean_brightness} for an image."""
+            import numpy as _np
+            h, w = img.shape[:2]
+            channels = img.shape[2] if len(img.shape) == 3 else 1
+            return {
+                "height": h, "width": w, "channels": channels,
+                "mean_brightness": round(float(_np.mean(img)), 1),
+            }
+
+        def cv_encode_jpg(img, quality: int = 85) -> bytes:
+            """
+            Encode a numpy image to JPEG bytes.
+            Example: set_result(cv_encode_jpg(img)) to surface a debug frame.
+            """
+            import cv2 as _cv2
+            _, buf = _cv2.imencode(
+                ".jpg", img, [_cv2.IMWRITE_JPEG_QUALITY, int(quality)])
+            return bytes(buf)
+
+        def cv_draw_boxes(img, contours: list, color: tuple = (0, 255, 0),
+                          thickness: int = 2):
+            """
+            Draw bounding boxes from cv_find_contours / cv_detect_aruco onto
+            a BGR image. Returns a new annotated copy (does not modify in-place).
+            """
+            import cv2 as _cv2
+            out = img.copy()
+            for c in contours:
+                if "x" in c:  # contour dict
+                    _cv2.rectangle(
+                        out, (c["x"], c["y"]),
+                        (c["x"] + c["w"], c["y"] + c["h"]),
+                        color, thickness)
+                if "cx" in c and "cy" in c:
+                    _cv2.circle(out, (int(c["cx"]), int(c["cy"])), 4, color, -1)
+            return out
+
+        # ── dry-run motion stubs (overrides) ─────────────────────────── #
+        # These replace the real motion / navigation / behavior functions
+        # when dry_run=True so the program can be tested without physically
+        # moving the robot.
+        if dry_run:
+            _real_stop = stop  # keep real stop so _execute finally still works
+
+            def move(linear: float = 0.0, angular: float = 0.0,
+                     duration: float = 0.0) -> None:
+                log(f"[DRY-RUN] move(linear={linear}, angular={angular}, "
+                    f"duration={duration})")
+                if duration > 0:
+                    dsl_sleep(min(duration, 1.0))
+
+            def stop() -> None:
+                log("[DRY-RUN] stop()")
+
+            def move_distance(distance_m: float, speed: float = 0.0,
+                              timeout_s: float = 20.0,
+                              collision_avoidance: bool = True) -> dict:
+                log(f"[DRY-RUN] move_distance({distance_m}m, speed={speed})")
+                return {"status": "completed", "distance_m": distance_m,
+                        "dry_run": True}
+
+            def rotate(angle_deg: float, speed: float = 0.0,
+                       timeout_s: float = 15.0) -> dict:
+                log(f"[DRY-RUN] rotate({angle_deg}°, speed={speed})")
+                return {"status": "completed", "angle_deg": angle_deg,
+                        "dry_run": True}
+
+            def check_collision(linear_x: float = 0.15) -> dict:
+                scan = get_scan(timeout_s=0.3)  # still read real sensor
+                if scan:
+                    return {"blocked": scan.get("front_min_m", 1.0) < linear_x + 0.2,
+                            "distance_m": scan.get("front_min_m", 1.0),
+                            "dry_run": True}
+                return {"blocked": False, "distance_m": 1.0, "dry_run": True}
+
+            def navigate_to_pose(x: float, y: float, yaw: float = 0.0,
+                                 timeout_s: float = 60.0) -> dict:
+                log(f"[DRY-RUN] navigate_to_pose(x={x}, y={y}, yaw={yaw:.3f})")
+                return {"status": "completed", "dry_run": True}
+
+            def go_to_waypoint(name: str, timeout_s: float = 60.0) -> dict:
+                log(f"[DRY-RUN] go_to_waypoint('{name}')")
+                return {"status": "completed", "dry_run": True}
+
+            def find_object(label: str, timeout_s: float = 20.0,
+                            collision_avoidance: bool = True) -> dict:
+                log(f"[DRY-RUN] find_object('{label}')")
+                return {"found": False, "dry_run": True}
+
+            def approach_object(label: str, stop_distance: float = 0.5,
+                                timeout_s: float = 30.0,
+                                collision_avoidance: bool = True) -> dict:
+                log(f"[DRY-RUN] approach_object('{label}', "
+                    f"stop_dist={stop_distance})")
+                return {"status": "not_found", "dry_run": True}
+
+            def follow_wall(side: str = "left", target_distance: float = 0.35,
+                            duration_s: float = 10.0, speed: float = 0.0) -> dict:
+                log(f"[DRY-RUN] follow_wall(side='{side}', "
+                    f"target={target_distance}m, dur={duration_s}s)")
+                dsl_sleep(min(duration_s, 1.0))
+                return {"status": "completed", "dry_run": True}
+
         # ── build namespace ──────────────────────────────────────────── #
         # Whitelisted builtins only
         safe_builtins = {
@@ -616,6 +1050,7 @@ class DSLRuntime:
             "get_detections": get_detections,
             "get_imu": get_imu,
             "get_battery": get_battery,
+            "get_image": get_image,
 
             # Motion functions
             "move": move,
@@ -648,6 +1083,7 @@ class DSLRuntime:
             "elapsed": elapsed,
             "set_result": set_result,
             "time": time.time,
+            "dry_run": dry_run,  # programs can check this flag
 
             # Math
             "math": math,
@@ -658,6 +1094,20 @@ class DSLRuntime:
             "cos": math.cos,
             "radians": math.radians,
             "degrees": math.degrees,
+
+            # OpenCV vision utilities
+            "cv_gray": cv_gray,
+            "cv_resize": cv_resize,
+            "cv_blur": cv_blur,
+            "cv_canny": cv_canny,
+            "cv_hsv_filter": cv_hsv_filter,
+            "cv_find_contours": cv_find_contours,
+            "cv_largest_blob": cv_largest_blob,
+            "cv_hough_lines": cv_hough_lines,
+            "cv_detect_aruco": cv_detect_aruco,
+            "cv_image_stats": cv_image_stats,
+            "cv_encode_jpg": cv_encode_jpg,
+            "cv_draw_boxes": cv_draw_boxes,
         }
 
         return ns

@@ -8,9 +8,12 @@ that the agent can discover and call all tools automatically.
 
 import asyncio
 import base64
+import collections
 import json
 import logging
 import math
+import re
+import threading as _threading
 import time
 import urllib.request
 from typing import Any, Optional
@@ -18,38 +21,139 @@ from typing import Any, Optional
 from fastmcp import FastMCP
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.utilities.types import Image
+from starlette.requests import Request as _SR
+from starlette.responses import JSONResponse as _JR
 
 logger = logging.getLogger(__name__)
 
 
+# --------------------------------------------------------------------------- #
+# MCP call log — circular buffer, last 200 tool invocations.                  #
+# Populated by LoggingMiddleware; served at GET /mcp_api/log.                 #
+# --------------------------------------------------------------------------- #
+
+_MAX_LOG      = 200
+_mcp_call_log: collections.deque = collections.deque(maxlen=_MAX_LOG)
+_mcp_log_lock = _threading.Lock()
+_mcp_log_seq: int = 0   # monotonic counter — increments on every call
+
+# Detect base64-encoded blobs so we don't flood the UI with raw image data.
+_B64_RE  = re.compile(r'^[A-Za-z0-9+/]{80,}={0,2}$')
+_ARG_MAX  = 300   # chars for truncated argument display
+_RESP_MAX = 600   # chars for truncated response display
+
+
+def _trunc_arg(val: Any) -> Any:
+    """Return a display-safe version of a single argument value."""
+    if not isinstance(val, str):
+        return val
+    if len(val) > 60 and _B64_RE.match(val[:80]):
+        return f"[BASE64 ~{len(val)} chars]"
+    if len(val) > _ARG_MAX:
+        return val[:_ARG_MAX] + f" ...({len(val) - _ARG_MAX} more chars)"
+    return val
+
+
+def _trunc_resp(text: str) -> str:
+    """Return a compact representation of a response string."""
+    if len(text) <= _RESP_MAX:
+        return text
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            summary = {}
+            for k, v in list(parsed.items())[:12]:
+                if isinstance(v, str) and len(v) > 80:
+                    summary[k] = v[:80] + "..."
+                elif isinstance(v, (list, dict)):
+                    summary[k] = f"[{type(v).__name__} len={len(v)}]"
+                else:
+                    summary[k] = v
+            suffix = f" ...+{len(parsed) - 12} more keys" if len(parsed) > 12 else ""
+            return json.dumps(summary, ensure_ascii=False) + suffix
+    except Exception:
+        pass
+    return text[:_RESP_MAX] + f" ...({len(text) - _RESP_MAX} more chars)"
+
+
+def _result_texts(result: Any) -> tuple[str, str]:
+    """Return (short_display, full_text) from a FastMCP CallToolResult."""
+    content = getattr(result, "content", None)
+    if content is None:
+        raw = str(result)
+        return _trunc_resp(raw), raw[:8000]
+    parts_short: list[str] = []
+    parts_full:  list[str] = []
+    for item in content:
+        mime = getattr(item, "mimeType", None)
+        if mime and mime.startswith("image/"):
+            data = getattr(item, "data", "")
+            size = len(data) if isinstance(data, (bytes, bytearray)) else len(str(data))
+            tag  = f"[IMAGE {mime} ~{size} chars/bytes]"
+            parts_short.append(tag)
+            parts_full.append(tag)
+        else:
+            text = str(getattr(item, "text", item))
+            parts_short.append(_trunc_resp(text))
+            parts_full.append(text[:8000])
+    return "\n".join(parts_short), "\n".join(parts_full)
+
+
 class LoggingMiddleware(Middleware):
-    """Logs every tool call with name, arguments, duration, and error status."""
+    """Logs every tool call and appends an entry to _mcp_call_log.
+
+    Large/binary argument values (e.g. base64 images) are summarised so the
+    log stays compact and the cam_web /mcp trace UI remains snappy.
+    """
 
     async def on_call_tool(
         self,
         context: MiddlewareContext,
         call_next: CallNext,
     ) -> Any:
-        params = context.message
+        global _mcp_log_seq
+        params    = context.message
         tool_name = getattr(params, "name", "<unknown>")
-        arguments = getattr(params, "arguments", {})
-        args_str = ", ".join(f"{k}={v!r}" for k, v in (arguments or {}).items())
+        arguments = getattr(params, "arguments", {}) or {}
+        args_str  = ", ".join(f"{k}={v!r}" for k, v in arguments.items())
         logger.info("[MCP CALL] %s(%s)", tool_name, args_str)
-        t0 = time.monotonic()
+
+        t0        = time.monotonic()
+        wall_time = time.time()
+
+        display_args = {k: _trunc_arg(v)  for k, v in arguments.items()}
+        full_args    = {k: str(v)[:4096]  for k, v in arguments.items()}
+
+        def _append(status: str, short_resp: str, full_resp: str, elapsed: float) -> None:
+            global _mcp_log_seq
+            with _mcp_log_lock:
+                _mcp_log_seq += 1
+                _mcp_call_log.append({
+                    "seq":           _mcp_log_seq,
+                    "ts":            wall_time,
+                    "tool":          tool_name,
+                    "args":          display_args,
+                    "args_full":     full_args,
+                    "status":        status,
+                    "duration_ms":   round(elapsed * 1000),
+                    "response":      short_resp,
+                    "response_full": full_resp,
+                })
+
         try:
-            result = await call_next(context)
-            elapsed = time.monotonic() - t0
+            result   = await call_next(context)
+            elapsed  = time.monotonic() - t0
             is_error = getattr(result, "isError", False)
-            logger.info(
-                "[MCP RETURN] %s → %s in %.3fs",
-                tool_name,
-                "ERROR" if is_error else "OK",
-                elapsed,
-            )
+            status   = "error" if is_error else "ok"
+            logger.info("[MCP RETURN] %s -> %s in %.3fs", tool_name, status.upper(), elapsed)
+            short_r, full_r = _result_texts(result)
+            _append(status, short_r, full_r, elapsed)
             return result
         except Exception as exc:  # noqa: BLE001
             elapsed = time.monotonic() - t0
+            msg = f"{type(exc).__name__}: {exc}"
             logger.error("[MCP ERROR] %s raised %s in %.3fs", tool_name, exc, elapsed)
+            _append("exception", msg, msg, elapsed)
             raise
 
 from ros2_mcp_bridge.ros_node import (
@@ -123,8 +227,14 @@ mcp = FastMCP(
         "wall-follow, and any multi-step reactive behaviour. Use dsl_run_inline for "
         "quick one-shot scripts and dsl_store_program + dsl_run_program for reusable "
         "routines. Programs execute locally at ~20 Hz with access to get_scan(), "
-        "get_detections(), move(), rotate(), stop(), move_distance(), find_object(), "
-        "approach_object(), follow_wall(), navigate_to_pose(), etc. "
+        "get_detections(), get_image() (BGR numpy), move(), rotate(), stop(), "
+        "move_distance(), find_object(), approach_object(), follow_wall(), "
+        "navigate_to_pose(), and a full OpenCV toolkit (cv_hsv_filter, "
+        "cv_find_contours, cv_detect_aruco, cv_canny, cv_hough_lines, …). "
+        "WORKFLOW: (1) dsl_validate(source) — instant syntax + forbidden-call check. "
+        "(2) dsl_run_inline(source, dry_run=True) — test logic with live sensors, all "
+        "motion replaced by log stubs, no robot movement. (3) Run for real. "
+        "Runtime errors include DSL-frame tracebacks with line numbers. "
         "Prefer DSL over chaining individual MCP tool calls — it avoids round-trip "
         "latency and does not incur repeated image/VLM costs. "
         "Manage stored programs with dsl_list_programs, dsl_get_source, "
@@ -140,6 +250,27 @@ mcp = FastMCP(
     ),
     middleware=[LoggingMiddleware()],
 )
+
+
+# --------------------------------------------------------------------------- #
+# MCP trace API  (consumed by the cam_web /mcp trace page)                    #
+# --------------------------------------------------------------------------- #
+
+@mcp.custom_route("/mcp_api/log", methods=["GET"])
+async def _mcp_api_log(request: _SR) -> _JR:
+    """Return the circular call log as JSON for the cam_web trace UI."""
+    with _mcp_log_lock:
+        entries = list(_mcp_call_log)
+    return _JR({"entries": entries, "total_ever": _mcp_log_seq})
+
+
+@mcp.custom_route("/mcp_api/clear", methods=["POST"])
+async def _mcp_api_clear(request: _SR) -> _JR:
+    """Clear the call log."""
+    global _mcp_log_seq
+    with _mcp_log_lock:
+        _mcp_call_log.clear()
+    return _JR({"ok": True, "seq_after_clear": _mcp_log_seq})
 
 
 # --------------------------------------------------------------------------- #
@@ -1265,6 +1396,24 @@ def _dsl_result_to_dict(r) -> dict:
 
 
 @mcp.tool(
+    title="DSL: Validate",
+    description=(
+        "Statically validate DSL source code without executing it or moving the robot. "
+        "Reports syntax errors (with line/column numbers), forbidden statements "
+        "(imports, open, eval, exec, …), and warnings about possibly-undefined names. "
+        "Always call this before dsl_run_inline or dsl_store_program when writing new "
+        "programs — it catches errors instantly without consuming any execution time."
+    ),
+)
+def dsl_validate(source: str) -> str:
+    """
+    Args:
+        source: Python-DSL source code to validate.
+    """
+    return json.dumps(_dsl.validate_source(source))
+
+
+@mcp.tool(
     title="DSL: Store Program",
     description=(
         "Store a named Python-DSL program for later execution on the robot. "
@@ -1272,7 +1421,8 @@ def _dsl_result_to_dict(r) -> dict:
         "\n"
         "SENSORS: get_scan() → {front_min_m, left_min_m, right_min_m, rear_min_m, ...}, "
         "get_detections() → [{label, confidence, bbox, distance_m, distance_source, ...}], "
-        "get_odom() → {x, y, yaw_rad, yaw_deg}, get_imu(), get_battery()\n"
+        "get_odom() → {x, y, yaw_rad, yaw_deg}, get_imu(), get_battery(), "
+        "get_image() → BGR numpy array from camera (or None)\n"
         "\n"
         "MOTION: move(linear, angular, duration=0) — publish twist (duration=0 means single "
         "publish, >0 means run for that duration then stop), stop() — immediate halt, "
@@ -1292,11 +1442,30 @@ def _dsl_result_to_dict(r) -> dict:
         "shared with the LLM scratchpad tools, list_memory() → {key: value}, "
         "delete_memory(key) → bool\n"
         "\n"
+        "OPENCV VISION: get_image() → BGR numpy array; "
+        "cv_gray(img), cv_resize(img,w,h), cv_blur(img,k=5), "
+        "cv_canny(img, low=50, high=150) → edge mask, "
+        "cv_hsv_filter(img, [H,S,V]_lower, [H,S,V]_upper) → binary mask, "
+        "cv_find_contours(mask, min_area=100) → [{area,cx,cy,x,y,w,h},...], "
+        "cv_largest_blob(mask) → {cx,cy,area,x,y,w,h} or None, "
+        "cv_hough_lines(edges, threshold=50) → [{x1,y1,x2,y2,length,angle_deg},...], "
+        "cv_detect_aruco(img, dict_type='DICT_4X4_50') → [{id,corners,cx,cy},...], "
+        "cv_image_stats(img) → {height,width,channels,mean_brightness}, "
+        "cv_encode_jpg(img, quality=85) → JPEG bytes (use with set_result()), "
+        "cv_draw_boxes(img, contours) → annotated copy. "
+        "All cv_* functions import opencv internally — no explicit import needed.\n"
+        "\n"
         "CONTROL: sleep(seconds) — interruptible, log(msg) — append to output, "
         "elapsed() → seconds since start, set_result(value) — set return value, "
-        "print() → redirected to log(), params dict — runtime parameters\n"
+        "print() → redirected to log(), params dict — runtime parameters, "
+        "dry_run bool — True when called via dsl_run_inline/dsl_run_program with dry_run=True\n"
         "\n"
         "MATH: math module, pi, sqrt, sin, cos, atan2, radians, degrees\n"
+        "\n"
+        "WORKFLOW: 1) Write your program. 2) Call dsl_validate(source) \u2014 check for syntax "
+        "errors and forbidden statements BEFORE running. 3) Call dsl_run_inline(source, dry_run=True) "
+        "to test logic against live sensors without moving the robot. 4) Run for real via "
+        "dsl_run_inline(source) or store + dsl_run_program.\n"
         "\n"
         "RULES: No imports, no file I/O, no network. Use 'while True:' loops "
         "with sleep() for continuous behaviours — the program will be stopped "
@@ -1353,25 +1522,31 @@ def dsl_store_program(
         "The program runs synchronously — this tool call blocks until the "
         "program finishes, is stopped, or times out. "
         "Pass runtime params as a JSON object to override defaults. "
-        "Returns the program's log output, return value, and status."
+        "Returns the program's log output, return value, and status.\n"
+        "\n"
+        "Set dry_run=true to test program logic without physically moving the "
+        "robot — all motion, navigation, and behavior calls are replaced with "
+        "no-op stubs that log what they would do. Sensors still return live data."
     ),
 )
 def dsl_run_program(
     name: str,
     params: str = "{}",
     timeout: float = 30.0,
+    dry_run: bool = False,
 ) -> str:
     """
     Args:
-        name:    Name of a previously stored program.
-        params:  JSON object of runtime parameters (merged with defaults).
-        timeout: Maximum execution time in seconds (default 30, max 300).
+        name:     Name of a previously stored program.
+        params:   JSON object of runtime parameters (merged with defaults).
+        timeout:  Maximum execution time in seconds (default 30, max 300).
+        dry_run:  If true, replace all motion calls with logging stubs.
     """
     try:
         p = json.loads(params) if isinstance(params, str) else params
     except json.JSONDecodeError as e:
         return json.dumps({"error": f"params is not valid JSON: {e}"})
-    result = _dsl.run_program(name, p, timeout)
+    result = _dsl.run_program(name, p, timeout, dry_run=dry_run)
     return json.dumps(_dsl_result_to_dict(result))
 
 
@@ -1381,25 +1556,32 @@ def dsl_run_program(
         "Compile and execute a DSL script directly without storing it. "
         "Use this for quick one-off reactive behaviours. "
         "For re-usable programs, prefer dsl_store_program + dsl_run_program. "
-        "Same namespace and rules as stored programs."
+        "Same namespace and rules as stored programs.\n"
+        "\n"
+        "Set dry_run=true to test program logic without physically moving the "
+        "robot — all motion, navigation, and behavior calls are replaced with "
+        "no-op stubs that log what they would do. Sensors (scan, odom, camera) "
+        "still return live data so vision / logic branches are exercised normally."
     ),
 )
 def dsl_run_inline(
     source: str,
     params: str = "{}",
     timeout: float = 30.0,
+    dry_run: bool = False,
 ) -> str:
     """
     Args:
-        source:  Python-DSL source code to execute.
-        params:  JSON object of runtime parameters.
-        timeout: Maximum execution time in seconds (default 30, max 300).
+        source:   Python-DSL source code to execute.
+        params:   JSON object of runtime parameters.
+        timeout:  Maximum execution time in seconds (default 30, max 300).
+        dry_run:  If true, replace all motion calls with logging stubs.
     """
     try:
         p = json.loads(params) if isinstance(params, str) else params
     except json.JSONDecodeError as e:
         return json.dumps({"error": f"params is not valid JSON: {e}"})
-    result = _dsl.run_inline(source, p, timeout)
+    result = _dsl.run_inline(source, p, timeout, dry_run=dry_run)
     return json.dumps(_dsl_result_to_dict(result))
 
 
