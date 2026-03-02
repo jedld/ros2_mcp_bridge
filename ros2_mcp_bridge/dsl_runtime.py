@@ -846,6 +846,24 @@ class DSLRuntime:
             """Return all saved waypoints as {name: {x, y, yaw_deg}}."""
             return dict(waypoints)
 
+        def cancel_navigation() -> dict:
+            """Cancel the currently active Nav2 goal. Returns status dict."""
+            _guard()
+            return node.cancel_navigation()
+
+        def set_initial_pose(
+            x: float, y: float, yaw_deg: float = 0.0,
+            cov_xy: float = 0.25, cov_yaw: float = 0.0685,
+        ) -> dict:
+            """Publish /initialpose for AMCL (static-map mode only)."""
+            _guard()
+            return node.set_initial_pose(x, y, math.radians(yaw_deg), cov_xy, cov_yaw)
+
+        def get_map_info() -> dict | None:
+            """Return current map metadata and occupancy statistics, or None."""
+            _guard()
+            return node.get_map_metadata(timeout=3.0)
+
         # ── behavior functions ───────────────────────────────────────── #
         ca_global = ca_enabled
 
@@ -1167,6 +1185,19 @@ class DSLRuntime:
                 log(f"[DRY-RUN] go_to_waypoint('{name}')")
                 return {"status": "completed", "dry_run": True}
 
+            def cancel_navigation() -> dict:
+                log("[DRY-RUN] cancel_navigation()")
+                return {"status": "cancel_requested", "dry_run": True}
+
+            def set_initial_pose(
+                x: float, y: float, yaw_deg: float = 0.0,
+                cov_xy: float = 0.25, cov_yaw: float = 0.0685,
+            ) -> dict:
+                log(f"[DRY-RUN] set_initial_pose(x={x}, y={y}, yaw={yaw_deg}°)")
+                return {"status": "published", "dry_run": True}
+
+            # get_map_info reads real sensor data, no stub needed
+
             def find_object(label: str, timeout_s: float = 20.0,
                             collision_avoidance: bool = True) -> dict:
                 log(f"[DRY-RUN] find_object('{label}')")
@@ -1227,6 +1258,9 @@ class DSLRuntime:
             "save_waypoint": save_waypoint,
             "go_to_waypoint": go_to_waypoint,
             "list_waypoints": list_waypoints,
+            "cancel_navigation": cancel_navigation,
+            "set_initial_pose": set_initial_pose,
+            "get_map_info": get_map_info,
 
             # Behaviors
             "find_object": find_object,

@@ -76,6 +76,12 @@ class ROS2BridgeNode(Node):
         self._nav_client = None
         self._nav_lock = threading.Lock()
 
+        # Active Nav2 goal handle (for cancel) and initial-pose publisher (lazy)
+        self._nav_goal_handle = None
+        self._nav_goal_lock = threading.Lock()
+        self._initial_pose_pub = None
+        self._initial_pose_lock = threading.Lock()
+
         # ------------------------------------------------------------------ #
         # Build subscriptions from config
         # ------------------------------------------------------------------ #
@@ -829,18 +835,114 @@ class ROS2BridgeNode(Node):
             result_holder[0] = future.result()
             done_event.set()
 
+        def goal_response_cb(f):
+            goal_handle = f.result()
+            with self._nav_goal_lock:
+                self._nav_goal_handle = goal_handle
+            goal_handle.get_result_async().add_done_callback(done_cb)
+
         future = self._nav_client.send_goal_async(goal)
-        future.add_done_callback(
-            lambda f: f.result().get_result_async().add_done_callback(done_cb)
-        )
+        future.add_done_callback(goal_response_cb)
 
         if not done_event.wait(timeout):
+            with self._nav_goal_lock:
+                self._nav_goal_handle = None
             return {"status": "timeout", "message": f"Navigation timed out after {timeout}s."}
 
+        with self._nav_goal_lock:
+            self._nav_goal_handle = None
         status = result_holder[0].status  # 4 = succeeded, 6 = aborted
         if status == 4:
             return {"status": "succeeded", "message": "Reached goal."}
         return {"status": "failed", "message": f"Navigation failed (status={status})."}
+
+    def cancel_navigation(self, timeout: float = 5.0) -> dict:
+        """Cancel the currently active Nav2 navigation goal."""
+        with self._nav_goal_lock:
+            handle = self._nav_goal_handle
+        if handle is None:
+            return {"status": "no_active_goal"}
+        done_ev = threading.Event()
+        cancel_future = handle.cancel_goal_async()
+        cancel_future.add_done_callback(lambda _f: done_ev.set())
+        done_ev.wait(timeout)
+        with self._nav_goal_lock:
+            self._nav_goal_handle = None
+        return {"status": "cancel_requested"}
+
+    def set_initial_pose(
+        self,
+        x: float,
+        y: float,
+        yaw_rad: float,
+        cov_xy: float = 0.25,
+        cov_yaw: float = 0.0685,
+    ) -> dict:
+        """Publish a PoseWithCovarianceStamped to /initialpose for AMCL."""
+        try:
+            from geometry_msgs.msg import PoseWithCovarianceStamped
+        except ImportError:
+            return {"status": "failed", "message": "geometry_msgs not available."}
+        with self._initial_pose_lock:
+            if self._initial_pose_pub is None:
+                self._initial_pose_pub = self.create_publisher(
+                    PoseWithCovarianceStamped, "/initialpose", 10
+                )
+        msg = PoseWithCovarianceStamped()
+        msg.header.frame_id = "map"
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.pose.pose.position.x = float(x)
+        msg.pose.pose.position.y = float(y)
+        msg.pose.pose.orientation.z = math.sin(yaw_rad / 2.0)
+        msg.pose.pose.orientation.w = math.cos(yaw_rad / 2.0)
+        # Diagonal covariance [x, y, z, roll, pitch, yaw] (6x6 row-major)
+        cov = [0.0] * 36
+        cov[0]  = cov_xy   # x variance
+        cov[7]  = cov_xy   # y variance
+        cov[35] = cov_yaw  # yaw variance
+        msg.pose.covariance = cov
+        self._initial_pose_pub.publish(msg)
+        self.get_logger().info(
+            f"[ros2_mcp_bridge] Published initial pose: x={x:.3f} y={y:.3f} yaw={math.degrees(yaw_rad):.1f}°"
+        )
+        return {"status": "published", "x": x, "y": y, "yaw_rad": yaw_rad,
+                "yaw_deg": round(math.degrees(yaw_rad), 2)}
+
+    def subscribe_on_demand(self, topic: str, msg_cls, timeout: float = 3.0):
+        """Subscribe to *topic* lazily (if not already subscribed) and return latest message."""
+        with self._cache_lock:
+            already_subscribed = topic in self._cache
+        if not already_subscribed:
+            self._ensure_cache_entry(topic)
+            self.create_subscription(
+                msg_cls, topic,
+                lambda msg, t=topic: self._cache_cb(t, msg),
+                qos_profile_sensor_data, callback_group=self._cb,
+            )
+            self.get_logger().info(f"[ros2_mcp_bridge] On-demand subscription: {topic}")
+        return self.get_latest(topic, timeout)
+
+    def get_map_metadata(self, timeout: float = 3.0) -> dict | None:
+        """Return the current map metadata from /map_metadata, or None."""
+        try:
+            from nav_msgs.msg import MapMetaData
+        except ImportError:
+            return None
+        msg = self.subscribe_on_demand("/map_metadata", MapMetaData, timeout)
+        if msg is None:
+            return None
+        width_m  = round(msg.width  * msg.resolution, 2)
+        height_m = round(msg.height * msg.resolution, 2)
+        return {
+            "resolution_m_per_cell": round(msg.resolution, 4),
+            "width_cells":  msg.width,
+            "height_cells": msg.height,
+            "width_m":  width_m,
+            "height_m": height_m,
+            "origin_x": round(msg.origin.position.x, 4),
+            "origin_y": round(msg.origin.position.y, 4),
+            "total_cells": msg.width * msg.height,
+        }
 
 
 # --------------------------------------------------------------------------- #

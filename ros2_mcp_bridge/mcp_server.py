@@ -12,7 +12,9 @@ import collections
 import json
 import logging
 import math
+import os
 import re
+import subprocess
 import threading as _threading
 import time
 import urllib.request
@@ -195,6 +197,34 @@ def set_node(node: ROS2BridgeNode):
 
 
 # --------------------------------------------------------------------------- #
+# ROS 2 CLI service-call helper (used by SLAM management tools)
+# --------------------------------------------------------------------------- #
+
+_DEFAULT_MAPS_DIR = os.path.expanduser("~/maps")
+
+
+def _ros_service_call(service: str, type_str: str, request: str,
+                      timeout: float = 10.0) -> dict:
+    """Call a ROS 2 service via `ros2 service call` subprocess.
+
+    Returns {"output": ..., "returncode": 0} on success, or {"error": ...}.
+    """
+    cmd = ["ros2", "service", "call", service, type_str, request]
+    try:
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+        )
+        if r.returncode != 0:
+            return {"error": (r.stderr.strip() or r.stdout.strip() or "service call failed"),
+                    "returncode": r.returncode}
+        return {"output": r.stdout.strip(), "returncode": 0}
+    except subprocess.TimeoutExpired:
+        return {"error": f"service call timed out after {timeout}s"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# --------------------------------------------------------------------------- #
 # FastMCP server
 # --------------------------------------------------------------------------- #
 
@@ -211,10 +241,26 @@ mcp = FastMCP(
         "MOTION TOOLS: move_distance (precise, odometry-closed-loop), rotate_angle (precise), "
         "move_robot (timed open-loop), stop_robot.\n"
         "\n"
-        "NAVIGATION: navigate_to_pose (Nav2), save_waypoint / go_to_waypoint / list_waypoints "
-        "(session-level named poses).\n"
+        "NAVIGATION: navigate_to_pose (Nav2, map frame), nav2_cancel_navigation, "
+        "save_waypoint / go_to_waypoint / list_waypoints / delete_waypoint / update_waypoint "
+        "(session-level named poses). Use get_map_info() to check the current occupancy "
+        "grid bounds and resolution before planning long-range goals.\n"
         "\n"
-
+        "SLAM / MAP MANAGEMENT: slam_get_status (check if slam_toolbox is running and "
+        "what mode it is in), get_map_info (map dimensions, resolution, free/occupied cell "
+        "counts), slam_save_map (save PGM+YAML map file AND pose graph to ~/maps/), "
+        "slam_serialize_map (serialize pose graph only, for later localization resumption), "
+        "slam_load_map (deserialize pose graph and switch to localization mode — "
+        "match_type 3=LOCALIZE_AT_POSE is best when you know start position), "
+        "slam_pause_mapping (pause/resume scan processing during fast motion), "
+        "slam_clear_map (wipe current SLAM state and start fresh), "
+        "nav2_set_initial_pose (for AMCL-based localization on a static pre-built map), "
+        "list_map_files (list ~/maps/ contents). "
+        "SLAM WORKFLOW: (1) Robot boots → slam_toolbox starts automatically in mapping mode. "
+        "(2) Drive/navigate to explore. (3) slam_save_map to persist map+graph. "
+        "(4) On next session, slam_load_map(match_type=3, x, y, yaw_deg) to resume "
+        "localization — no initial pose needed for AMCL.\n"
+        "\n"
         "VISION SUB-AGENTS (A2A): ask_vision_agent → Qwen3-VL-8B, best for scene description, "
         "object finding, OCR, counting. ask_cosmos_agent → NVIDIA Cosmos-Reason2-8B, best for "
         "navigation safety ('is it safe to move forward?'), obstacle bounding boxes, "
@@ -230,7 +276,8 @@ mcp = FastMCP(
         "get_detections() (VLM-first, falls back to YOLO; each detection includes source='vlm'/'yolo'), "
         "get_image() (BGR numpy), move(), rotate(), stop(), "
         "move_distance(), find_object(), approach_object(), follow_wall(), "
-        "navigate_to_pose(), and a full OpenCV toolkit (cv_hsv_filter, "
+        "navigate_to_pose(), cancel_navigation(), set_initial_pose(x,y,yaw_deg), "
+        "get_map_info(), and a full OpenCV toolkit (cv_hsv_filter, "
         "cv_find_contours, cv_detect_aruco, cv_canny, cv_hough_lines, …). "
         "WORKFLOW: (1) dsl_validate(source) — instant syntax + forbidden-call check. "
         "(2) dsl_run_inline(source, dry_run=True) — test logic with live sensors, all "
@@ -245,6 +292,9 @@ mcp = FastMCP(
         "instead of calling get_camera_image + get_laser_scan + get_robot_pose separately. "
         "Save interesting locations with save_waypoint so you can return to them. "
         "Use set_memory to record what rooms/areas have been checked. "
+        "After mapping a new environment call slam_save_map immediately so the map "
+        "survives a reboot. Use slam_load_map on the next session to resume localization "
+        "without re-exploring. "
         "For complex navigation that reacts to real-time sensor data (obstacle weaving, "
         "tracking a moving object, patrol routes), write a DSL program instead of chaining "
         "many individual move/read tool calls."
@@ -1099,6 +1149,357 @@ def list_waypoints() -> str:
     return json.dumps({"waypoints": _waypoints, "count": len(_waypoints)})
 
 
+@mcp.tool(
+    title="Delete Waypoint",
+    description="Remove a named waypoint from the session.",
+)
+def delete_waypoint(name: str) -> str:
+    """
+    Args:
+        name: Waypoint name to delete.
+    """
+    if name not in _waypoints:
+        return json.dumps({"error": f"Waypoint '{name}' not found.",
+                           "known": list(_waypoints.keys())})
+    del _waypoints[name]
+    return json.dumps({"status": "deleted", "name": name})
+
+
+@mcp.tool(
+    title="Update Waypoint",
+    description=(
+        "Manually set or overwrite a waypoint's position without navigating there. "
+        "Useful for pre-loading known room coordinates into the session, or for "
+        "correcting a saved waypoint after refining the map."
+    ),
+)
+def update_waypoint(name: str, x: float, y: float, yaw_deg: float = 0.0) -> str:
+    """
+    Args:
+        name:    Waypoint identifier.
+        x:       X position in map frame (metres).
+        y:       Y position in map frame (metres).
+        yaw_deg: Heading in degrees (default 0).
+    """
+    _waypoints[name] = {"x": x, "y": y, "yaw_deg": yaw_deg}
+    return json.dumps({"status": "ok", "name": name, "pose": _waypoints[name]})
+
+
+# --------------------------------------------------------------------------- #
+# SLAM / Map management tools                                                  #
+# --------------------------------------------------------------------------- #
+
+
+@mcp.tool(
+    title="SLAM: Get Status",
+    description=(
+        "Report the current state of slam_toolbox and Nav2. "
+        "Returns whether the SLAM node is running, current map dimensions, "
+        "resolution, and origin. "
+        "Call this first to understand the mapping/localization mode before "
+        "issuing navigation goals."
+    ),
+)
+def slam_get_status() -> str:
+    """Check slam_toolbox + Nav2 status."""
+    result: dict[str, Any] = {}
+
+    # --- map metadata ---
+    meta = _node.get_map_metadata(timeout=2.0)
+    if meta:
+        result["map"] = meta
+        result["map_available"] = True
+    else:
+        result["map_available"] = False
+        result["map"] = None
+
+    # --- slam_toolbox node alive? ---
+    try:
+        r = subprocess.run(
+            ["ros2", "node", "list"], capture_output=True, text=True, timeout=5
+        )
+        nodes = r.stdout.splitlines()
+        result["slam_toolbox_running"] = any("slam_toolbox" in n for n in nodes)
+        result["nav2_running"] = any("bt_navigator" in n for n in nodes)
+    except Exception as e:
+        result["node_list_error"] = str(e)
+        result["slam_toolbox_running"] = False
+        result["nav2_running"] = False
+
+    # --- nav2 action server ---
+    try:
+        r = subprocess.run(
+            ["ros2", "action", "list"], capture_output=True, text=True, timeout=5
+        )
+        result["navigate_to_pose_available"] = "/navigate_to_pose" in r.stdout
+    except Exception as e:
+        result["navigate_to_pose_available"] = False
+
+    return json.dumps(result)
+
+
+@mcp.tool(
+    title="Get Map Info",
+    description=(
+        "Return the current occupancy-grid map dimensions, resolution, origin, "
+        "and a breakdown of free / occupied / unknown cell counts. "
+        "Useful for understanding how much of the environment has been mapped "
+        "and choosing valid navigation goal coordinates."
+    ),
+)
+def get_map_info() -> str:
+    """Read /map and /map_metadata for detailed occupancy statistics."""
+    meta = _node.get_map_metadata(timeout=3.0)
+    if meta is None:
+        return json.dumps({"error": "No map available. Is slam_toolbox or map_server running?"})
+
+    # Try to also read the full /map OccupancyGrid for cell stats
+    try:
+        from nav_msgs.msg import OccupancyGrid
+        msg = _node.subscribe_on_demand("/map", OccupancyGrid, timeout=3.0)
+        if msg is not None:
+            data = msg.data
+            total = len(data)
+            free     = sum(1 for v in data if v == 0)
+            occupied = sum(1 for v in data if v > 50)
+            unknown  = total - free - occupied
+            meta["cells_free"]     = free
+            meta["cells_occupied"] = occupied
+            meta["cells_unknown"]  = unknown
+            meta["pct_free"]       = round(100 * free / total, 1) if total else 0
+            meta["pct_occupied"]   = round(100 * occupied / total, 1) if total else 0
+            meta["pct_unknown"]    = round(100 * unknown / total, 1) if total else 0
+    except Exception as e:
+        meta["cell_stats_error"] = str(e)
+
+    return json.dumps(meta)
+
+
+@mcp.tool(
+    title="SLAM: Save Map",
+    description=(
+        "Save the current SLAM map to disk in two formats:\n"
+        "1. PGM/PNG image + YAML metadata (for Nav2 static map server)\n"
+        "2. slam_toolbox pose graph .posegraph (for later localization resumption)\n"
+        "Files are saved as ~/maps/<filename_stem>.{pgm,yaml,posegraph,data}.\n"
+        "After calling this, the robot can be rebooted and navigation can resume "
+        "via slam_load_map without re-exploring."
+    ),
+)
+def slam_save_map(filename_stem: str = "map", directory: str = "") -> str:
+    """
+    Args:
+        filename_stem: Base name for saved files (default 'map'). Do not include extension.
+        directory:     Directory to save into (default ~/maps/).
+    """
+    save_dir = directory.strip() or _DEFAULT_MAPS_DIR
+    os.makedirs(save_dir, exist_ok=True)
+    full_stem = os.path.join(save_dir, filename_stem)
+    results: dict[str, Any] = {"directory": save_dir, "stem": filename_stem}
+
+    # 1. Save PGM/YAML via /slam_toolbox/save_map
+    req = "{" + f"name: {{data: '{full_stem}'}}" + "}"
+    r1 = _ros_service_call("/slam_toolbox/save_map", "slam_toolbox/srv/SaveMap", req, timeout=15)
+    results["pgm_yaml"] = r1
+
+    # 2. Serialize pose graph for future localization resumption
+    req2 = "{" + f"filename: '{full_stem}'" + "}"
+    r2 = _ros_service_call("/slam_toolbox/serialize_map",
+                           "slam_toolbox/srv/SerializePoseGraph", req2, timeout=15)
+    results["pose_graph"] = r2
+
+    # List created files
+    try:
+        files = [f for f in os.listdir(save_dir) if f.startswith(filename_stem)]
+        results["files_created"] = sorted(files)
+    except Exception:
+        pass
+
+    ok = (r1.get("returncode") == 0 or "error" not in r1) and \
+         (r2.get("returncode") == 0 or "error" not in r2)
+    results["status"] = "ok" if ok else "partial_failure"
+    return json.dumps(results)
+
+
+@mcp.tool(
+    title="SLAM: Serialize Map (pose graph only)",
+    description=(
+        "Serialize only the slam_toolbox pose graph to disk "
+        "(as ~/maps/<filename_stem>.posegraph and .data). "
+        "This is a lightweight checkpoint — no PGM image is generated. "
+        "Use slam_save_map to also get the PGM/YAML files needed by Nav2."
+    ),
+)
+def slam_serialize_map(filename_stem: str = "map", directory: str = "") -> str:
+    """
+    Args:
+        filename_stem: File stem (default 'map').
+        directory:     Save directory (default ~/maps/).
+    """
+    save_dir = directory.strip() or _DEFAULT_MAPS_DIR
+    os.makedirs(save_dir, exist_ok=True)
+    full_stem = os.path.join(save_dir, filename_stem)
+    req = "{" + f"filename: '{full_stem}'" + "}"
+    r = _ros_service_call("/slam_toolbox/serialize_map",
+                          "slam_toolbox/srv/SerializePoseGraph", req, timeout=15)
+    return json.dumps({"stem": full_stem, **r})
+
+
+@mcp.tool(
+    title="SLAM: Load Map (resume localization)",
+    description=(
+        "Load a previously serialized slam_toolbox pose graph and switch to "
+        "localization mode. This replaces the AMCL initial-pose requirement — "
+        "slam_toolbox already knows the map and can localize from the given start pose.\n"
+        "\n"
+        "match_type options:\n"
+        "  0 = UNSET         — start at origin\n"
+        "  1 = START_AT_FIRST_NODE — start at first map node\n"
+        "  2 = START_AT_GIVEN_POSE — start mapping from given pose (still builds map)\n"
+        "  3 = LOCALIZE_AT_POSE   — pure localization at given pose (recommended)\n"
+        "\n"
+        "Use match_type=3 and pass the robot's approximate current position. "
+        "Even a coarse estimate (within ~0.5 m) is sufficient for scan-matching."
+    ),
+)
+def slam_load_map(
+    filename_stem: str = "map",
+    directory: str = "",
+    match_type: int = 3,
+    x: float = 0.0,
+    y: float = 0.0,
+    yaw_deg: float = 0.0,
+) -> str:
+    """
+    Args:
+        filename_stem: Base name of the saved map files (no extension).
+        directory:     Directory where map files are stored (default ~/maps/).
+        match_type:    0/1/2/3 — see description above (default 3 = LOCALIZE_AT_POSE).
+        x:             Approximate start X in map frame (metres).
+        y:             Approximate start Y in map frame (metres).
+        yaw_deg:       Approximate start yaw (degrees).
+    """
+    save_dir = directory.strip() or _DEFAULT_MAPS_DIR
+    full_stem = os.path.join(save_dir, filename_stem)
+    yaw_rad = math.radians(yaw_deg)
+    req = ("{" +
+           f"filename: '{full_stem}', "
+           f"match_type: {match_type}, "
+           f"initial_pose: {{x: {x}, y: {y}, theta: {yaw_rad}}}"
+           + "}")
+    r = _ros_service_call("/slam_toolbox/deserialize_map",
+                          "slam_toolbox/srv/DeserializePoseGraph", req, timeout=20)
+    return json.dumps({"stem": full_stem, "match_type": match_type,
+                       "initial_pose": {"x": x, "y": y, "yaw_deg": yaw_deg}, **r})
+
+
+@mcp.tool(
+    title="SLAM: Pause / Resume Mapping",
+    description=(
+        "Toggle whether slam_toolbox processes incoming LiDAR scans. "
+        "Pause mapping during high-speed motion or when you deliberately want "
+        "to stop updating the map (e.g. while carrying the robot). "
+        "Each call toggles the state — call once to pause, call again to resume. "
+        "Returns the new pause status."
+    ),
+)
+def slam_pause_mapping() -> str:
+    """Toggle scan processing in slam_toolbox."""
+    r = _ros_service_call("/slam_toolbox/pause_new_measurements",
+                          "slam_toolbox/srv/Pause", "{}", timeout=5)
+    return json.dumps(r)
+
+
+@mcp.tool(
+    title="SLAM: Clear Map",
+    description=(
+        "Clear all pending changes / queued scans in slam_toolbox. "
+        "This discards unprocessed scan data but does NOT clear the built map graph. "
+        "Useful after large jumps or teleportation to prevent stale data from "
+        "corrupting the map. For a full map reset, restart the Nav2 service."
+    ),
+)
+def slam_clear_map() -> str:
+    """Call /slam_toolbox/clear_changes."""
+    r = _ros_service_call("/slam_toolbox/clear_changes",
+                          "slam_toolbox/srv/Clear", "{}", timeout=5)
+    return json.dumps(r)
+
+
+@mcp.tool(
+    title="Nav2: Set Initial Pose (for AMCL)",
+    description=(
+        "Publish an /initialpose message to initialize AMCL localization. "
+        "Only needed when using a STATIC pre-built map with AMCL (not slam_toolbox). "
+        "With slam_toolbox (the default setup), use slam_load_map instead — "
+        "it handles localization initialization automatically.\n"
+        "\n"
+        "covariance_xy and covariance_yaw control the uncertainty of the estimate. "
+        "Tighter estimates (< 0.1) converge faster; wider estimates allow AMCL to "
+        "search a larger area. Default 0.25 m² and 0.07 rad² are good starting values."
+    ),
+)
+def nav2_set_initial_pose(
+    x: float,
+    y: float,
+    yaw_deg: float = 0.0,
+    covariance_xy: float = 0.25,
+    covariance_yaw: float = 0.0685,
+) -> str:
+    """
+    Args:
+        x:              X position in map frame (metres).
+        y:              Y position in map frame (metres).
+        yaw_deg:        Heading in degrees.
+        covariance_xy:  Position uncertainty variance in m² (default 0.25).
+        covariance_yaw: Yaw uncertainty variance in rad² (default 0.07).
+    """
+    yaw_rad = math.radians(yaw_deg)
+    result = _node.set_initial_pose(x, y, yaw_rad, covariance_xy, covariance_yaw)
+    return json.dumps(result)
+
+
+@mcp.tool(
+    title="Nav2: Cancel Navigation",
+    description=(
+        "Cancel the currently active Nav2 navigation goal. "
+        "The robot will stop in place. "
+        "Returns immediately — the cancellation is sent asynchronously."
+    ),
+)
+def nav2_cancel_navigation() -> str:
+    """Cancel active Nav2 goal."""
+    result = _node.cancel_navigation()
+    return json.dumps(result)
+
+
+@mcp.tool(
+    title="List Map Files",
+    description=(
+        "List all saved map files in the maps directory (default ~/maps/). "
+        "Each map consists of multiple files: .pgm (image), .yaml (metadata), "
+        ".posegraph and .data (slam_toolbox serialized pose graph). "
+        "Pass the filename_stem (without extension) to slam_load_map to reload."
+    ),
+)
+def list_map_files(directory: str = "") -> str:
+    """
+    Args:
+        directory: Directory to list (default ~/maps/).
+    """
+    target = directory.strip() or _DEFAULT_MAPS_DIR
+    if not os.path.isdir(target):
+        return json.dumps({"directory": target, "files": [],
+                           "note": "Directory does not exist yet. Use slam_save_map to create it."})
+    files = sorted(os.listdir(target))
+    # Group by stem
+    stems: dict[str, list[str]] = {}
+    for f in files:
+        stem = f.rsplit(".", 1)[0] if "." in f else f
+        stems.setdefault(stem, []).append(f)
+    return json.dumps({"directory": target, "files": files, "map_stems": stems})
+
+
 # --------------------------------------------------------------------------- #
 # LLM scratchpad memory
 # --------------------------------------------------------------------------- #
@@ -1433,9 +1834,15 @@ def dsl_validate(source: str) -> str:
         "check_collision(linear_x) → {blocked, distance_m, ...}\n"
         "\n"
         "NAVIGATION: navigate_to_pose(x, y, yaw=0, timeout_s=60) — send goal to Nav2 (blocks), "
+        "cancel_navigation() → {status}, "
         "save_waypoint(name) → saves current pose as named waypoint, "
         "go_to_waypoint(name, timeout_s=60) — navigate to a saved waypoint via Nav2, "
         "list_waypoints() → {name: {x, y, yaw_deg}}\n"
+        "\n"
+        "SLAM/MAP: set_initial_pose(x, y, yaw_deg, cov_xy=0.25, cov_yaw=0.07) — publish /initialpose "
+        "for AMCL (only needed with static-map mode; slam_toolbox handles this automatically), "
+        "get_map_info() → {width_m, height_m, resolution, origin_x, origin_y, pct_free, "
+        "pct_occupied, pct_unknown} — use to check whether goal coordinates are inside the mapped area\n"
         "\n"
         "BEHAVIORS: find_object(label, timeout_s=20) — rotate searching for object, returns {found, detection}, "
         "approach_object(label, stop_distance=0.5, timeout_s=30) — drive toward detected object, "
