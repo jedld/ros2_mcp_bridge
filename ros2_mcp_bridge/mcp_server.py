@@ -267,6 +267,11 @@ mcp = FastMCP(
         "all-in-one), get_camera_info (intrinsic matrix, FOV, distortion — use for pixel↔3D math), "
         "get_laser_scan, get_robot_pose, detect_objects_in_image, get_imu, get_battery_state.\n"
         "\n"
+        "DEPTH / FLOOR TOOLS: get_depth_map (colourised monocular depth image + zone distances, "
+        "metric-anchored when LiDAR is available), get_depth_zones (left/center/right obstacle "
+        "distances without an image), analyse_floor (floor anomaly/obstacle/spill detection). "
+        "These require the onit-depth-service to be running.\n"
+        "\n"
         "MOTION TOOLS: move_distance (precise, odometry-closed-loop), rotate_angle (precise), "
         "move_robot (timed open-loop), stop_robot.\n"
         "\n"
@@ -658,6 +663,228 @@ def detect_objects_in_image(jpeg_b64: str = "", timeout: float = 3.0) -> str:
         det.update(dist)
 
     return json.dumps(result)
+
+
+# --------------------------------------------------------------------------- #
+# Depth estimation & floor analysis tools  (backed by depth_service HTTP)     #
+# --------------------------------------------------------------------------- #
+
+def _depth_cfg() -> tuple[bool, str]:
+    """Return (enabled, base_url) from bridge.yaml depth_service section."""
+    ds = _node._cfg.get("depth_service", {})
+    return ds.get("enabled", False), ds.get("url", "http://localhost:8083")
+
+
+def _depth_service_healthy(base_url: str) -> bool:
+    """Quick health-check against the depth service."""
+    try:
+        req = urllib.request.Request(f"{base_url}/health", method="GET")
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def _capture_jpeg_bytes(timeout: float = 3.0) -> bytes | None:
+    """Grab the latest camera JPEG from the ROS topic (reusable helper)."""
+    cfg_topics = _node._cfg.get("topics", {})
+    topic = cfg_topics.get("camera", {}).get("topic", "/camera/image_raw/compressed")
+    msg = _node.get_latest(topic, timeout=timeout)
+    if msg is None:
+        return None
+    return bytes(msg.data)
+
+
+@mcp.tool(
+    title="Get Depth Map",
+    description=(
+        "Run monocular depth estimation (Depth Anything V2) on the current camera "
+        "frame and return a colourised depth-map image (JPEG). "
+        "Closer pixels appear warmer (yellow/red), farther pixels appear cooler (blue/purple).\n"
+        "\n"
+        "Also returns left/center/right zone obstacle distance estimates (heuristic, "
+        "metres) via the X-Depth-Zones header when a LiDAR front distance is available "
+        "for metric anchoring.\n"
+        "\n"
+        "If jpeg_b64 is omitted the latest camera frame is captured automatically."
+    ),
+)
+def get_depth_map(jpeg_b64: str = "", timeout: float = 3.0) -> str | Image:
+    """
+    Args:
+        jpeg_b64: Base64-encoded JPEG to analyse. Leave empty to auto-capture.
+        timeout:  Seconds to wait for camera frame when auto-capturing (default 3.0).
+    """
+    enabled, base_url = _depth_cfg()
+    if not enabled:
+        return json.dumps({"error": "Depth service is disabled in bridge.yaml (depth_service.enabled=false)."})
+    if not _depth_service_healthy(base_url):
+        return json.dumps({"error": f"Depth service not reachable at {base_url}. Is onit-depth-service running?"})
+
+    # Resolve JPEG bytes
+    if jpeg_b64:
+        try:
+            jpeg_bytes = base64.b64decode(jpeg_b64)
+        except Exception as exc:
+            return json.dumps({"error": f"Invalid base64: {exc}"})
+    else:
+        jpeg_bytes = _capture_jpeg_bytes(timeout)
+        if jpeg_bytes is None:
+            return json.dumps({"error": "No camera frame available."})
+
+    # Try metric depth if we have a LiDAR front distance
+    cfg_topics = _node._cfg.get("topics", {})
+    laser_topic = cfg_topics.get("laser", {}).get("topic", "/scan")
+    scan_msg = _node.get_latest(laser_topic, timeout=0.5)
+    front_m = 0.0
+    if scan_msg is not None:
+        ranges = list(scan_msg.ranges)
+        n = len(ranges)
+        # front = index 0 for standard LiDAR
+        window = ranges[max(0, n-5):] + ranges[:5]
+        valid = [r for r in window if scan_msg.range_min < r < scan_msg.range_max]
+        if valid:
+            front_m = min(valid)
+
+    if front_m > 0.05:
+        # Metric depth via multipart POST
+        boundary = b"----DepthBoundary"
+        body = (
+            b"--" + boundary + b"\r\n"
+            b"Content-Disposition: form-data; name=\"image\"; filename=\"frame.jpg\"\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" +
+            jpeg_bytes + b"\r\n"
+            b"--" + boundary + b"\r\n"
+            b"Content-Disposition: form-data; name=\"front_m\"\r\n\r\n" +
+            f"{front_m:.3f}".encode() + b"\r\n"
+            b"--" + boundary + b"--\r\n"
+        )
+        req = urllib.request.Request(
+            f"{base_url}/depth/metric",
+            data=body, method="POST",
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary.decode()}"},
+        )
+    else:
+        # Relative depth only
+        req = urllib.request.Request(
+            f"{base_url}/depth",
+            data=jpeg_bytes, method="POST",
+            headers={"Content-Type": "image/jpeg"},
+        )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30.0) as resp:
+            depth_jpeg = resp.read()
+            zones_hdr = resp.headers.get("X-Depth-Zones")
+    except Exception as exc:
+        return json.dumps({"error": f"Depth inference failed: {exc}"})
+
+    # Return as an image; attach zone info as a follow-up text block
+    result_parts: list = [Image(data=depth_jpeg, format="jpeg")]
+    zones = {}
+    if zones_hdr:
+        try:
+            zones = json.loads(zones_hdr)
+        except Exception:
+            pass
+    if not zones and front_m <= 0.05:
+        # Fall back to GET /depth_zones if we cached one
+        try:
+            zr = urllib.request.urlopen(f"{base_url}/depth_zones", timeout=3.0)
+            zones = json.loads(zr.read())
+        except Exception:
+            pass
+
+    meta = {"front_lidar_m": round(front_m, 3) if front_m > 0.05 else None}
+    if zones:
+        meta["depth_zones"] = zones
+    return [*result_parts, json.dumps(meta)]
+
+
+@mcp.tool(
+    title="Get Depth Zones",
+    description=(
+        "Get obstacle distance estimates (metres) for left, center, and right "
+        "image zones from the depth model, without returning an image. "
+        "If a LiDAR front distance is available, distances are metric-anchored; "
+        "otherwise they are heuristic relative estimates.\n"
+        "\n"
+        "Returns: {\"left_m\": <float>, \"center_m\": <float>, \"right_m\": <float>}\n"
+        "\n"
+        "Use this for quick obstacle-clearance checks without the overhead of "
+        "transferring a depth-map image."
+    ),
+)
+def get_depth_zones(timeout: float = 3.0) -> str:
+    """
+    Args:
+        timeout: Seconds to wait for camera frame (default 3.0).
+    """
+    enabled, base_url = _depth_cfg()
+    if not enabled:
+        return json.dumps({"error": "Depth service disabled in bridge.yaml."})
+    if not _depth_service_healthy(base_url):
+        return json.dumps({"error": f"Depth service not reachable at {base_url}."})
+
+    jpeg_bytes = _capture_jpeg_bytes(timeout)
+    if jpeg_bytes is None:
+        return json.dumps({"error": "No camera frame available."})
+
+    req = urllib.request.Request(
+        f"{base_url}/depth/zones",
+        data=jpeg_bytes, method="POST",
+        headers={"Content-Type": "image/jpeg"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20.0) as resp:
+            return resp.read().decode()
+    except Exception as exc:
+        return json.dumps({"error": f"Depth zone estimation failed: {exc}"})
+
+
+@mcp.tool(
+    title="Analyse Floor",
+    description=(
+        "Analyse the floor region of the current camera frame for anomalies: "
+        "obstacles, steps, wet/reflective surfaces, or spills.\n"
+        "\n"
+        "Returns JSON:\n"
+        "  ok     — true if floor appears clear\n"
+        "  reason — human-readable summary\n"
+        "  details.depth_var   — variance of floor depth (high = obstacle/step)\n"
+        "  details.depth_mean  — mean relative depth of floor region\n"
+        "  details.texture_lap — Laplacian texture energy (low = wet/reflective)\n"
+        "\n"
+        "Use before driving forward to check for ground-level hazards that "
+        "the 2D LiDAR cannot detect (the LiDAR beam is ~13 cm high and misses "
+        "objects below it)."
+    ),
+)
+def analyse_floor(timeout: float = 3.0) -> str:
+    """
+    Args:
+        timeout: Seconds to wait for camera frame (default 3.0).
+    """
+    enabled, base_url = _depth_cfg()
+    if not enabled:
+        return json.dumps({"error": "Depth service disabled in bridge.yaml."})
+    if not _depth_service_healthy(base_url):
+        return json.dumps({"error": f"Depth service not reachable at {base_url}."})
+
+    jpeg_bytes = _capture_jpeg_bytes(timeout)
+    if jpeg_bytes is None:
+        return json.dumps({"error": "No camera frame available."})
+
+    req = urllib.request.Request(
+        f"{base_url}/floor",
+        data=jpeg_bytes, method="POST",
+        headers={"Content-Type": "image/jpeg"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20.0) as resp:
+            return resp.read().decode()
+    except Exception as exc:
+        return json.dumps({"error": f"Floor analysis failed: {exc}"})
 
 
 @mcp.tool(
