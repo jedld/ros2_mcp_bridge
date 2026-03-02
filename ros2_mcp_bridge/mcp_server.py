@@ -209,14 +209,14 @@ def _resolve_maps_dir(directory: str) -> str:
     - Empty / blank → ~/maps  (the default)
     - Starts with ~ → expand ~
     - Already absolute → use as-is
-    - Relative (e.g. 'maps') → treat as ~/maps/<relative>
+    - Relative (e.g. 'maps') → resolve under $HOME so 'maps' → ~/maps
     """
     d = directory.strip()
     if not d:
         return _DEFAULT_MAPS_DIR
     d = os.path.expanduser(d)
     if not os.path.isabs(d):
-        d = os.path.join(_DEFAULT_MAPS_DIR, d)
+        d = os.path.join(os.path.expanduser("~"), d)
     return d
 
 
@@ -239,6 +239,18 @@ def _ros_service_call(service: str, type_str: str, request: str,
         return {"error": f"service call timed out after {timeout}s"}
     except Exception as e:
         return {"error": str(e)}
+
+
+def _service_exists(service_name: str, timeout: float = 3.0) -> bool:
+    """Check whether a ROS 2 service is currently advertised."""
+    try:
+        r = subprocess.run(
+            ["ros2", "service", "list"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        return service_name in r.stdout.splitlines()
+    except Exception:
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -1300,7 +1312,10 @@ def get_map_info() -> str:
         "2. slam_toolbox pose graph .posegraph (for later localization resumption)\n"
         "Files are saved as ~/maps/<filename_stem>.{pgm,yaml,posegraph,data}.\n"
         "After calling this, the robot can be rebooted and navigation can resume "
-        "via slam_load_map without re-exploring."
+        "via slam_load_map without re-exploring.\n"
+        "\n"
+        "If slam_toolbox is not running, falls back to nav2_map_server's "
+        "map_saver_cli to save the PGM/YAML only (no pose graph)."
     ),
 )
 def slam_save_map(filename_stem: str = "map", directory: str = "") -> str:
@@ -1314,16 +1329,32 @@ def slam_save_map(filename_stem: str = "map", directory: str = "") -> str:
     full_stem = os.path.join(save_dir, filename_stem)
     results: dict[str, Any] = {"directory": save_dir, "stem": filename_stem}
 
-    # 1. Save PGM/YAML via /slam_toolbox/save_map
-    req = "{" + f"name: {{data: '{full_stem}'}}" + "}"
-    r1 = _ros_service_call("/slam_toolbox/save_map", "slam_toolbox/srv/SaveMap", req, timeout=15)
-    results["pgm_yaml"] = r1
+    # 1. Save PGM/YAML via map_saver_cli (always — more reliable than slam_toolbox's
+    #    internal map_saver which can fail with "Failed to spin map subscription").
+    try:
+        r = subprocess.run(
+            ["ros2", "run", "nav2_map_server", "map_saver_cli",
+             "-f", full_stem, "--ros-args", "-p", "save_map_timeout:=10.0"],
+            capture_output=True, text=True, timeout=20,
+        )
+        if r.returncode == 0:
+            results["pgm_yaml"] = {"output": r.stdout.strip(), "returncode": 0}
+        else:
+            results["pgm_yaml"] = {"error": (r.stderr.strip() or r.stdout.strip() or
+                                             "map_saver_cli failed"), "returncode": r.returncode}
+    except subprocess.TimeoutExpired:
+        results["pgm_yaml"] = {"error": "map_saver_cli timed out after 20s"}
+    except Exception as e:
+        results["pgm_yaml"] = {"error": str(e)}
 
-    # 2. Serialize pose graph for future localization resumption
-    req2 = "{" + f"filename: '{full_stem}'" + "}"
-    r2 = _ros_service_call("/slam_toolbox/serialize_map",
-                           "slam_toolbox/srv/SerializePoseGraph", req2, timeout=15)
-    results["pose_graph"] = r2
+    # 2. Serialize pose graph (only if slam_toolbox is running)
+    if _service_exists("/slam_toolbox/serialize_map"):
+        req2 = "{" + f"filename: '{full_stem}'" + "}"
+        r2 = _ros_service_call("/slam_toolbox/serialize_map",
+                               "slam_toolbox/srv/SerializePoseGraph", req2, timeout=15)
+        results["pose_graph"] = r2
+    else:
+        results["pose_graph"] = {"note": "slam_toolbox not running — pose graph skipped (PGM/YAML still saved)"}
 
     # List created files
     try:
@@ -1332,9 +1363,9 @@ def slam_save_map(filename_stem: str = "map", directory: str = "") -> str:
     except Exception:
         pass
 
-    ok = (r1.get("returncode") == 0 or "error" not in r1) and \
-         (r2.get("returncode") == 0 or "error" not in r2)
-    results["status"] = "ok" if ok else "partial_failure"
+    pgm_ok = "error" not in results.get("pgm_yaml", {})
+    pg_ok = "error" not in results.get("pose_graph", {})
+    results["status"] = "ok" if (pgm_ok and pg_ok) else "partial_failure"
     return json.dumps(results)
 
 
@@ -1353,6 +1384,11 @@ def slam_serialize_map(filename_stem: str = "map", directory: str = "") -> str:
         filename_stem: File stem (default 'map').
         directory:     Save directory (default ~/maps/).
     """
+    if not _service_exists("/slam_toolbox/serialize_map"):
+        return json.dumps({
+            "error": "slam_toolbox is not running — /slam_toolbox/serialize_map service unavailable. "
+                     "Restart the Nav2+SLAM service or use slam_save_map (which can fall back to map_saver_cli)."
+        })
     save_dir = _resolve_maps_dir(directory)
     os.makedirs(save_dir, exist_ok=True)
     full_stem = os.path.join(save_dir, filename_stem)
@@ -1396,6 +1432,8 @@ def slam_load_map(
         y:             Approximate start Y in map frame (metres).
         yaw_deg:       Approximate start yaw (degrees).
     """
+    if not _service_exists("/slam_toolbox/deserialize_map"):
+        return json.dumps({"error": "slam_toolbox is not running — /slam_toolbox/deserialize_map service unavailable."})
     save_dir = _resolve_maps_dir(directory)
     full_stem = os.path.join(save_dir, filename_stem)
     yaw_rad = math.radians(yaw_deg)
@@ -1422,6 +1460,8 @@ def slam_load_map(
 )
 def slam_pause_mapping() -> str:
     """Toggle scan processing in slam_toolbox."""
+    if not _service_exists("/slam_toolbox/pause_new_measurements"):
+        return json.dumps({"error": "slam_toolbox is not running — service unavailable."})
     r = _ros_service_call("/slam_toolbox/pause_new_measurements",
                           "slam_toolbox/srv/Pause", "{}", timeout=5)
     return json.dumps(r)
@@ -1438,6 +1478,8 @@ def slam_pause_mapping() -> str:
 )
 def slam_clear_map() -> str:
     """Call /slam_toolbox/clear_changes."""
+    if not _service_exists("/slam_toolbox/clear_changes"):
+        return json.dumps({"error": "slam_toolbox is not running — service unavailable."})
     r = _ros_service_call("/slam_toolbox/clear_changes",
                           "slam_toolbox/srv/Clear", "{}", timeout=5)
     return json.dumps(r)
