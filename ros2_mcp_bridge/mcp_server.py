@@ -203,6 +203,23 @@ def set_node(node: ROS2BridgeNode):
 _DEFAULT_MAPS_DIR = os.path.expanduser("~/maps")
 
 
+def _resolve_maps_dir(directory: str) -> str:
+    """Return an absolute maps directory path.
+
+    - Empty / blank → ~/maps  (the default)
+    - Starts with ~ → expand ~
+    - Already absolute → use as-is
+    - Relative (e.g. 'maps') → treat as ~/maps/<relative>
+    """
+    d = directory.strip()
+    if not d:
+        return _DEFAULT_MAPS_DIR
+    d = os.path.expanduser(d)
+    if not os.path.isabs(d):
+        d = os.path.join(_DEFAULT_MAPS_DIR, d)
+    return d
+
+
 def _ros_service_call(service: str, type_str: str, request: str,
                       timeout: float = 10.0) -> dict:
     """Call a ROS 2 service via `ros2 service call` subprocess.
@@ -1292,7 +1309,7 @@ def slam_save_map(filename_stem: str = "map", directory: str = "") -> str:
         filename_stem: Base name for saved files (default 'map'). Do not include extension.
         directory:     Directory to save into (default ~/maps/).
     """
-    save_dir = directory.strip() or _DEFAULT_MAPS_DIR
+    save_dir = _resolve_maps_dir(directory)
     os.makedirs(save_dir, exist_ok=True)
     full_stem = os.path.join(save_dir, filename_stem)
     results: dict[str, Any] = {"directory": save_dir, "stem": filename_stem}
@@ -1336,7 +1353,7 @@ def slam_serialize_map(filename_stem: str = "map", directory: str = "") -> str:
         filename_stem: File stem (default 'map').
         directory:     Save directory (default ~/maps/).
     """
-    save_dir = directory.strip() or _DEFAULT_MAPS_DIR
+    save_dir = _resolve_maps_dir(directory)
     os.makedirs(save_dir, exist_ok=True)
     full_stem = os.path.join(save_dir, filename_stem)
     req = "{" + f"filename: '{full_stem}'" + "}"
@@ -1379,7 +1396,7 @@ def slam_load_map(
         y:             Approximate start Y in map frame (metres).
         yaw_deg:       Approximate start yaw (degrees).
     """
-    save_dir = directory.strip() or _DEFAULT_MAPS_DIR
+    save_dir = _resolve_maps_dir(directory)
     full_stem = os.path.join(save_dir, filename_stem)
     yaw_rad = math.radians(yaw_deg)
     req = ("{" +
@@ -1487,7 +1504,7 @@ def list_map_files(directory: str = "") -> str:
     Args:
         directory: Directory to list (default ~/maps/).
     """
-    target = directory.strip() or _DEFAULT_MAPS_DIR
+    target = _resolve_maps_dir(directory)
     if not os.path.isdir(target):
         return json.dumps({"directory": target, "files": [],
                            "note": "Directory does not exist yet. Use slam_save_map to create it."})
