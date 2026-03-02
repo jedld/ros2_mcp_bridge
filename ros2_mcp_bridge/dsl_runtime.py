@@ -562,23 +562,177 @@ class DSLRuntime:
                 return None
             return odometry_to_dict(msg)
 
-        def get_detections(timeout_s: float = 0.5) -> list[dict]:
-            """Read detection array → list of {label, confidence, bbox, distance_m, ...}."""
+        # VLM detection prompt — asks the model to return a structured JSON list
+        # of every visible object with normalised bounding-box coordinates.
+        _VLM_DETECT_PROMPT = (
+            "Identify every distinct object visible in this image.\n"
+            "Reply with ONLY a JSON object (no markdown, no explanation):\n"
+            '{"objects": [{"label": "bottle", "confidence": 0.9, '
+            '"cx": 0.52, "cy": 0.45, "w": 0.12, "h": 0.28}]}\n'
+            "cx and cy are the fractional centre of each object "
+            "(0.0=left/top … 1.0=right/bottom); "
+            "w and h are the fractional width and height of its bounding box."
+        )
+
+        def _try_vlm_detections(vlm_timeout_s: float) -> list[dict] | None:
+            """Attempt VLM-based object detection.
+
+            Returns a list (possibly empty) on success, or None if VLM is
+            disabled / unavailable — caller should then fall back to YOLO.
+            """
+            vlm_cfg = cfg.get("vlm_agent", {})
+            if not vlm_cfg.get("enabled", False):
+                return None
+            vlm_url = vlm_cfg.get("url", "").rstrip("/")
+            if not vlm_url:
+                return None
+
+            # Get current camera frame
+            import base64
+            cam_topic = cfg_topics.get("camera", {}).get(
+                "topic", "/camera/image_raw/compressed")
+            cam_msg = node.get_latest(cam_topic, timeout=min(2.0, vlm_timeout_s))
+            if cam_msg is None:
+                logger.debug("VLM detection: no camera frame available")
+                return None
+
+            img_b64 = base64.b64encode(bytes(cam_msg.data)).decode("utf-8")
+            fmt = (cam_msg.format or "jpeg").lower().split("/")[-1]
+            mime_type = f"image/{fmt}"
+
+            # Build A2A message/send payload
+            try:
+                import uuid as _uuid
+                import httpx as _httpx
+                import json as _json
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": str(_uuid.uuid4()),
+                    "method": "message/send",
+                    "params": {
+                        "message": {
+                            "role": "user",
+                            "messageId": str(_uuid.uuid4()),
+                            "parts": [
+                                {"kind": "text", "text": _VLM_DETECT_PROMPT},
+                                {"kind": "file", "file": {
+                                    "bytes": img_b64,
+                                    "mimeType": mime_type,
+                                    "name": "camera_frame.jpg",
+                                }},
+                            ],
+                        }
+                    },
+                }
+                with _httpx.Client(timeout=vlm_timeout_s) as _client:
+                    resp = _client.post(vlm_url, json=payload)
+                    resp.raise_for_status()
+                data = resp.json()
+            except Exception as exc:
+                logger.debug("VLM detection HTTP error, falling back to YOLO: %s", exc)
+                return None
+
+            # Extract text from A2A response
+            text: str | None = None
+            result = data.get("result", {})
+            for artifact in result.get("artifacts", []):
+                for part in artifact.get("parts", []):
+                    if part.get("kind") == "text":
+                        text = part["text"]
+                        break
+            if text is None:
+                task_result = result.get("result")
+                if task_result:
+                    for part in task_result.get("parts", []):
+                        if part.get("kind") == "text":
+                            text = part["text"]
+                            break
+            if text is None:
+                for part in result.get("parts", []):
+                    if part.get("kind") == "text":
+                        text = part["text"]
+                        break
+            if not text:
+                logger.debug("VLM detection: empty response, falling back to YOLO")
+                return None
+
+            # Parse JSON (handle optional markdown code fences)
+            try:
+                text = text.strip()
+                if text.startswith("```"):
+                    text = text.split("```")[1]
+                    if text.startswith("json"):
+                        text = text[4:]
+                parsed = _json.loads(text)
+            except Exception as exc:
+                logger.debug("VLM detection: JSON parse error (%s), falling back to YOLO", exc)
+                return None
+
+            objects = parsed.get("objects", [])
+            if not isinstance(objects, list):
+                return None
+
+            # Convert fractional bbox → pixel coords (matching YOLO bbox format)
+            detections: list[dict] = []
+            for obj in objects:
+                if not isinstance(obj, dict) or "label" not in obj:
+                    continue
+                try:
+                    cx_px = float(obj.get("cx", 0.5)) * image_width
+                    cy_px = float(obj.get("cy", 0.5)) * image_height
+                    w_px  = float(obj.get("w",  0.1)) * image_width
+                    h_px  = float(obj.get("h",  0.1)) * image_height
+                    detections.append({
+                        "label":      str(obj["label"]),
+                        "confidence": round(float(obj.get("confidence", 0.8)), 3),
+                        "source":     "vlm",
+                        "bbox": {
+                            "cx": round(cx_px, 1),
+                            "cy": round(cy_px, 1),
+                            "w":  round(w_px,  1),
+                            "h":  round(h_px,  1),
+                        },
+                    })
+                except (TypeError, ValueError):
+                    continue
+            return detections  # may be empty list — that's valid (nothing seen)
+
+        def get_detections(timeout_s: float = 0.5,
+                           vlm_timeout_s: float = 8.0) -> list[dict]:
+            """Detect objects: tries VLM first, falls back to YOLO/topic.
+
+            Returns list of {label, confidence, source, bbox, distance_m, ...}.
+            ``source`` is "vlm" when the VLM answered, "yolo" otherwise.
+            Set vlm_timeout_s=0 to skip VLM and go straight to YOLO.
+            """
             _guard()
-            topic = cfg_topics.get("detections", {}).get("topic", "/detections")
-            msg = node.get_latest(topic, timeout=timeout_s)
-            if msg is None:
-                return []
-            d = detections_to_dict(msg)
-            # Enrich with distance estimates
+            # Pre-fetch LiDAR for distance enrichment (both paths)
             laser_topic = cfg_topics.get("laser", {}).get("topic", "/scan")
             scan_msg = node.get_latest(laser_topic, timeout=0.3)
-            for det in d["detections"]:
+
+            # ── VLM path ─────────────────────────────────────────────── #
+            dets: list[dict] | None = None
+            if vlm_timeout_s > 0:
+                dets = _try_vlm_detections(vlm_timeout_s)
+
+            # ── YOLO fallback ─────────────────────────────────────────── #
+            if dets is None:
+                topic = cfg_topics.get("detections", {}).get("topic", "/detections")
+                msg = node.get_latest(topic, timeout=timeout_s)
+                if msg is None:
+                    return []
+                d = detections_to_dict(msg)
+                dets = d["detections"]
+                for det in dets:
+                    det.setdefault("source", "yolo")
+
+            # ── Distance enrichment (shared) ──────────────────────────── #
+            for det in dets:
                 dist = estimate_detection_distance(
                     scan_msg, det, image_width, image_height, hfov_deg,
                 )
                 det.update(dist)
-            return d["detections"]
+            return dets
 
         def get_imu(timeout_s: float = 0.5) -> dict | None:
             """Read IMU → {orientation, angular_velocity, linear_acceleration} or None."""

@@ -15,6 +15,9 @@ import threading
 import types
 from types import SimpleNamespace
 
+import json as _json_module
+from unittest import mock as _mock
+
 import cv2
 import numpy as np
 import pytest
@@ -482,6 +485,230 @@ class TestExecution:
         t.join(timeout=5.0)
         assert not t.is_alive(), "Program thread should have stopped"
         assert errors == []
+
+
+# ===========================================================================
+# TestVLMDetections — VLM-first get_detections() with YOLO fallback
+# ===========================================================================
+
+def _vlm_response_json(objects: list) -> dict:
+    """Build a minimal A2A message/send response body with an object list."""
+    text = _json_module.dumps({"objects": objects})
+    return {
+        "result": {
+            "artifacts": [
+                {"parts": [{"kind": "text", "text": text}]}
+            ]
+        }
+    }
+
+
+def _make_vlm_runtime():
+    """Return (DSLRuntime, MockNode) with vlm_agent.enabled=True."""
+    cfg = {
+        "topics": {
+            "laser":      {"topic": "/scan"},
+            "odom":       {"topic": "/odom"},
+            "imu":        {"topic": "/imu"},
+            "battery":    {"topic": "/battery_state"},
+            "camera":     {"topic": "/camera/image_raw/compressed"},
+            "detections": {"topic": "/detections"},
+        },
+        "image_width": 640,
+        "camera_hfov_deg": 62.0,
+        "collision_avoidance": {"enabled": True},
+        "vlm_agent": {
+            "enabled": True,
+            "url": "http://localhost:9002",
+        },
+    }
+    topics = {
+        "/scan":          MockNode._SCAN,
+        "/odom":          MockNode._ODOM,
+        "/imu":           MockNode._IMU,
+        "/battery_state": MockNode._BATT,
+        "/detections":    MockNode._DETS,
+    }
+    node = MockNode(topic_data=topics)
+    from ros2_mcp_bridge.dsl_runtime import DSLRuntime
+    dsl = DSLRuntime(node, cfg)
+    return dsl, node
+
+
+def _patched_vlm_client(resp_body: dict):
+    """Return a mock httpx.Client context-manager yielding mock_resp."""
+    mock_resp = _mock.MagicMock()
+    mock_resp.json.return_value = resp_body
+    mock_resp.raise_for_status = _mock.Mock()
+    patcher = _mock.patch("httpx.Client")
+    MockClient = patcher.start()
+    MockClient.return_value.__enter__ = _mock.Mock(return_value=MockClient.return_value)
+    MockClient.return_value.__exit__ = _mock.Mock(return_value=False)
+    MockClient.return_value.post.return_value = mock_resp
+    return patcher
+
+
+class TestVLMDetections:
+    """Tests for VLM-first get_detections() with YOLO fallback."""
+
+    # ── VLM disabled / bypassed → YOLO fallback ────────────────────────
+
+    def test_vlm_disabled_falls_back_to_yolo(self):
+        """Default config has no vlm_agent; YOLO result arrives with source='yolo'."""
+        r = run("dets = get_detections()\nset_result(dets)")
+        assert r["status"] == "completed"
+        dets = r["return_value"]
+        assert isinstance(dets, list) and len(dets) > 0
+        assert dets[0]["label"] == "person"
+        assert dets[0].get("source") == "yolo"
+
+    def test_vlm_timeout_zero_forces_yolo(self):
+        """vlm_timeout_s=0 skips VLM even when vlm_agent is enabled."""
+        dsl, _ = _make_vlm_runtime()
+        result = dsl.run_inline(
+            "dets = get_detections(vlm_timeout_s=0)\nset_result(dets)"
+        )
+        assert result.status == "completed"
+        dets = result.return_value
+        assert len(dets) > 0
+        assert dets[0]["source"] == "yolo"
+
+    # ── VLM enabled but unavailable → YOLO fallback ────────────────────
+
+    def test_vlm_http_error_falls_back_to_yolo(self):
+        """httpx error → silent fallback to YOLO; program still completes."""
+        import httpx as _httpx
+        dsl, _ = _make_vlm_runtime()
+        with _mock.patch("httpx.Client") as MockClient:
+            MockClient.return_value.__enter__ = _mock.Mock(
+                return_value=MockClient.return_value)
+            MockClient.return_value.__exit__ = _mock.Mock(return_value=False)
+            MockClient.return_value.post.side_effect = _httpx.ConnectError("refused")
+            result = dsl.run_inline(
+                "dets = get_detections()\nset_result(dets)"
+            )
+        assert result.status == "completed"
+        dets = result.return_value
+        assert any(d["label"] == "person" for d in dets)
+        assert all(d.get("source") == "yolo" for d in dets)
+
+    def test_vlm_bad_json_falls_back_to_yolo(self):
+        """Unparseable VLM response text → fallback to YOLO."""
+        bad_resp = {
+            "result": {
+                "artifacts": [{"parts": [{"kind": "text", "text": "NOT JSON!"}]}]
+            }
+        }
+        dsl, _ = _make_vlm_runtime()
+        patcher = _patched_vlm_client(bad_resp)
+        try:
+            result = dsl.run_inline(
+                "dets = get_detections()\nset_result(dets)"
+            )
+        finally:
+            patcher.stop()
+        assert result.status == "completed"
+        dets = result.return_value
+        assert any(d["label"] == "person" for d in dets)
+
+    # ── VLM returns valid detections ───────────────────────────────────
+
+    def test_vlm_detections_parsed_correctly(self):
+        """Valid VLM JSON → source='vlm', label/confidence correct."""
+        resp = _vlm_response_json([
+            {"label": "cup", "confidence": 0.88,
+             "cx": 0.5, "cy": 0.5, "w": 0.1, "h": 0.15},
+        ])
+        dsl, _ = _make_vlm_runtime()
+        patcher = _patched_vlm_client(resp)
+        try:
+            result = dsl.run_inline(
+                "dets = get_detections()\nset_result(dets)"
+            )
+        finally:
+            patcher.stop()
+        assert result.status == "completed"
+        dets = result.return_value
+        assert len(dets) == 1
+        d = dets[0]
+        assert d["label"] == "cup"
+        assert d["source"] == "vlm"
+        assert d["confidence"] == pytest.approx(0.88)
+
+    def test_vlm_bbox_pixel_conversion(self):
+        """Fractional bbox coords are scaled to image_width × image_height."""
+        # image_width=640, image_height = 640 * 480/640 = 480
+        resp = _vlm_response_json([
+            {"label": "box", "confidence": 0.9,
+             "cx": 0.25, "cy": 0.75, "w": 0.5, "h": 0.5},
+        ])
+        dsl, _ = _make_vlm_runtime()
+        patcher = _patched_vlm_client(resp)
+        try:
+            result = dsl.run_inline(
+                "dets = get_detections()\nset_result(dets[0]['bbox'])"
+            )
+        finally:
+            patcher.stop()
+        assert result.status == "completed"
+        bbox = result.return_value
+        assert bbox["cx"] == pytest.approx(0.25 * 640, abs=1.0)   # 160
+        assert bbox["cy"] == pytest.approx(0.75 * 480, abs=1.0)   # 360
+        assert bbox["w"]  == pytest.approx(0.50 * 640, abs=1.0)   # 320
+        assert bbox["h"]  == pytest.approx(0.50 * 480, abs=1.0)   # 240
+
+    def test_vlm_empty_objects_list_no_yolo_fallback(self):
+        """VLM returns objects:[] → empty list (VLM answered, saw nothing)."""
+        resp = _vlm_response_json([])
+        dsl, _ = _make_vlm_runtime()
+        patcher = _patched_vlm_client(resp)
+        try:
+            result = dsl.run_inline(
+                "dets = get_detections()\nset_result(len(dets))"
+            )
+        finally:
+            patcher.stop()
+        assert result.status == "completed"
+        assert result.return_value == 0  # VLM said nothing; YOLO not queried
+
+    def test_vlm_multiple_objects_all_have_vlm_source(self):
+        """Multiple VLM detections all carry source='vlm'."""
+        resp = _vlm_response_json([
+            {"label": "chair", "confidence": 0.9, "cx": 0.3, "cy": 0.5, "w": 0.2, "h": 0.4},
+            {"label": "table", "confidence": 0.8, "cx": 0.7, "cy": 0.5, "w": 0.3, "h": 0.5},
+        ])
+        dsl, _ = _make_vlm_runtime()
+        patcher = _patched_vlm_client(resp)
+        try:
+            result = dsl.run_inline(
+                "sources = [d['source'] for d in get_detections()]\nset_result(sources)"
+            )
+        finally:
+            patcher.stop()
+        assert result.status == "completed"
+        assert result.return_value == ["vlm", "vlm"]
+
+    def test_vlm_markdown_fence_stripped(self):
+        """VLM response wrapped in ```json...``` is handled correctly."""
+        inner = _json_module.dumps({"objects": [
+            {"label": "plant", "confidence": 0.7,
+             "cx": 0.5, "cy": 0.5, "w": 0.1, "h": 0.2}
+        ]})
+        resp = {
+            "result": {"artifacts": [
+                {"parts": [{"kind": "text", "text": f"```json\n{inner}\n```"}]}
+            ]}
+        }
+        dsl, _ = _make_vlm_runtime()
+        patcher = _patched_vlm_client(resp)
+        try:
+            result = dsl.run_inline(
+                "dets = get_detections()\nset_result(dets[0]['label'])"
+            )
+        finally:
+            patcher.stop()
+        assert result.status == "completed"
+        assert result.return_value == "plant"
 
 
 # ===========================================================================
