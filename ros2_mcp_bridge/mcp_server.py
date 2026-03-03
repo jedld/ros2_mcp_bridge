@@ -295,10 +295,8 @@ mcp = FastMCP(
         "(4) On next session, slam_load_map(match_type=3, x, y, yaw_deg) to resume "
         "localization — no initial pose needed for AMCL.\n"
         "\n"
-        "VISION SUB-AGENTS (A2A): ask_vision_agent → Qwen3-VL-8B, best for scene description, "
-        "object finding, OCR, counting. ask_cosmos_agent → NVIDIA Cosmos-Reason2-8B, best for "
-        "navigation safety ('is it safe to move forward?'), obstacle bounding boxes, "
-        "embodied action planning ('what should the robot do next?').\n"
+        "VISION SUB-AGENT (A2A): ask_vision_agent → Qwen3-VL-8B, best for scene description, "
+        "object finding, OCR, counting, navigation safety assessment.\n"
         "\n"
         "MEMORY: set_memory / get_memory / list_memory / clear_memory — persistent scratchpad for "
         "noting observations, plans, and task state between tool calls.\n"
@@ -1992,75 +1990,6 @@ def _call_a2a_with_image(agent_url: str, question: str, img_b64: str,
         if part.get("kind") == "text":
             return part["text"]
     return None
-
-
-@mcp.tool(
-    title="Ask Cosmos Reasoning Agent",
-    description=(
-        "Capture the current camera frame and send it to the NVIDIA "
-        "Cosmos-Reason2-8B embodied reasoning agent. "
-        "Unlike the general VLM agent, Cosmos was specifically fine-tuned for "
-        "robotics and physical AI: it reasons about space, physics, and time, "
-        "provides bounding-box object coordinates, and can plan robot actions. "
-        "Use this for navigation decisions: "
-        "'Is it safe to move forward?', "
-        "'What obstacles are ahead and where exactly?', "
-        "'What action should the robot take next to reach the goal?', "
-        "'Describe the geometry of the path ahead.' "
-        "Returns a chain-of-thought reasoning trace followed by a concise answer. "
-        "Requires the Cosmos A2A agent to be running (see bridge.yaml cosmos_agent section)."
-    ),
-)
-def ask_cosmos_agent(
-    question: str = "Assess the scene from a robot navigation perspective. "
-                    "Is it safe to drive straight ahead? "
-                    "List any obstacles with their clock-position and estimated distance. "
-                    "Recommend: move forward / turn left / turn right / stop.",
-    timeout: float = 45.0,
-    image_timeout: float = 3.0,
-) -> str:
-    """
-    Args:
-        question:      What to ask Cosmos about the current camera frame.
-                       Best suited for navigation safety, obstacle detection,
-                       spatial bounding boxes, and action planning.
-        timeout:       Seconds to wait for Cosmos to respond (default 45 —
-                       Cosmos uses chain-of-thought so takes a little longer).
-        image_timeout: Seconds to wait for a camera frame (default 3).
-    """
-    import base64
-
-    cosmos_cfg = _node._cfg.get("cosmos_agent", {})
-    if not cosmos_cfg.get("enabled", False):
-        return json.dumps({
-            "error": "Cosmos agent is disabled. Set cosmos_agent.enabled: true and "
-                     "cosmos_agent.url in bridge.yaml, then restart the bridge. "
-                     "Start the agent on the robot with: "
-                     "onit --a2a --config ~/turtlebot3_ws/onit/configs/cosmos_agent.yaml"
-        })
-    cosmos_url = cosmos_cfg.get("url", "").rstrip("/")
-    if not cosmos_url:
-        return json.dumps({"error": "cosmos_agent.url is not set in bridge.yaml."})
-
-    cfg_topics = _node._cfg.get("topics", {})
-    cam_topic  = cfg_topics.get("camera", {}).get("topic", "/camera/image_raw/compressed")
-    cam_msg    = _node.get_latest(cam_topic, timeout=image_timeout)
-    if cam_msg is None:
-        return json.dumps({"error": f"No camera frame on {cam_topic} within {image_timeout}s."})
-
-    raw_bytes = bytes(cam_msg.data)
-    img_b64   = base64.b64encode(raw_bytes).decode("utf-8")
-    fmt       = (cam_msg.format or "jpeg").lower().split("/")[-1]
-    mime_type = f"image/{fmt}"
-
-    try:
-        text = _call_a2a_with_image(cosmos_url, question, img_b64, mime_type, timeout)
-    except Exception as exc:
-        return json.dumps({"error": f"Cosmos agent unreachable at {cosmos_url}: {exc}"})
-
-    if text is None:
-        return json.dumps({"error": "Cosmos agent returned no text."})
-    return json.dumps({"cosmos_response": text, "question": question})
 
 
 # --------------------------------------------------------------------------- #
