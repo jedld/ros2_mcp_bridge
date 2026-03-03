@@ -257,6 +257,49 @@ def _service_exists(service_name: str, timeout: float = 3.0) -> bool:
 # FastMCP server
 # --------------------------------------------------------------------------- #
 
+# Tools that only *observe* robot/environment state (no actuation, no
+# state-changing side effects).  Used to build the read-only endpoint so
+# that reasoning sub-agents (e.g. Cosmos) can perceive but never command.
+READONLY_TOOLS: frozenset[str] = frozenset({
+    # introspection
+    "list_ros2_topics",
+    "list_ros2_services",
+    # camera / perception
+    "get_camera_image",
+    "get_full_res_image",
+    "get_camera_info",
+    "detect_objects_in_image",
+    # depth / floor
+    "get_depth_map",
+    "get_depth_zones",
+    "analyse_floor",
+    # LiDAR / pose / odometry
+    "get_laser_scan",
+    "get_robot_pose",
+    "get_sensor_snapshot",
+    # hardware status
+    "get_battery_state",
+    "get_sensor_state",
+    "get_imu",
+    "get_magnetometer",
+    "get_joint_states",
+    # SLAM / map status (read-only queries)
+    "slam_get_status",
+    "get_map_info",
+    "list_map_files",
+    # waypoints (read-only)
+    "list_waypoints",
+    # memory (read-only)
+    "get_memory",
+    "list_memory",
+    # vision sub-agent (perception only)
+    "ask_vision_agent",
+    # DSL introspection (no execution)
+    "dsl_validate",
+    "dsl_list_programs",
+    "dsl_get_source",
+})
+
 mcp = FastMCP(
     "ROS2BridgeMCPServer",
     instructions=(
@@ -2256,6 +2299,66 @@ def dsl_delete_program(name: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Read-only FastMCP server  (shares the same functions, no actuation tools)   #
+# --------------------------------------------------------------------------- #
+
+mcp_readonly = FastMCP(
+    "ROS2BridgeReadOnly",
+    instructions=(
+        "Read-only sensor tools for observing a TurtleBot3 robot via ROS 2.\n"
+        "This endpoint exposes ONLY perception and status queries — no movement, "
+        "navigation, SLAM mutation, or DSL execution tools are available.\n"
+        "\n"
+        "SENSOR TOOLS: get_camera_image (visual), get_full_res_image (high-res), "
+        "get_sensor_snapshot (pose+lidar+detections+battery all-in-one), "
+        "get_camera_info (intrinsic matrix, FOV), get_laser_scan, get_robot_pose, "
+        "detect_objects_in_image, get_imu, get_battery_state, get_sensor_state, "
+        "get_magnetometer, get_joint_states.\n"
+        "\n"
+        "DEPTH / FLOOR TOOLS: get_depth_map, get_depth_zones, analyse_floor.\n"
+        "\n"
+        "STATUS QUERIES: slam_get_status, get_map_info, list_map_files, "
+        "list_waypoints, list_memory, get_memory.\n"
+        "\n"
+        "VISION SUB-AGENT: ask_vision_agent (Qwen3-VL-8B scene description).\n"
+        "\n"
+        "DSL INTROSPECTION: dsl_validate, dsl_list_programs, dsl_get_source "
+        "(no execution).\n"
+        "\n"
+        "Use get_sensor_snapshot for a combined view.  For spatial reasoning call "
+        "get_depth_zones or get_depth_map.  For object identification call "
+        "detect_objects_in_image or ask_vision_agent."
+    ),
+    middleware=[LoggingMiddleware()],
+)
+
+# Copy all read-only tool functions into the second server.
+# At module-load time every @mcp.tool()-decorated function is already bound to
+# `mcp`.  We iterate the set and add the *same Python function* to mcp_readonly
+# so both servers share the exact same implementation (plus share _node etc.).
+
+def _populate_readonly_server() -> None:
+    """Register READONLY_TOOLS on mcp_readonly after all tools are defined."""
+    import asyncio
+
+    async def _copy():
+        tool_objects = await mcp.list_tools()
+        name_to_tool = {t.name: t for t in tool_objects}
+        for tname in READONLY_TOOLS:
+            if tname in name_to_tool:
+                # get_tool returns the internal Tool object we can add directly
+                tool_obj = await mcp.get_tool(tname)
+                mcp_readonly.add_tool(tool_obj)
+            else:
+                logger.warning("Read-only tool '%s' not found in main server", tname)
+
+    # We're still at import/module-init time — no event loop running yet.
+    asyncio.run(_copy())
+
+_populate_readonly_server()
+
+
+# --------------------------------------------------------------------------- #
 # Server entry point (called by bridge.py)
 # --------------------------------------------------------------------------- #
 
@@ -2267,5 +2370,59 @@ def run(
     path: str = "/ros2",
     options: dict = None,
 ):
-    """Start the FastMCP server.  Blocks until the process exits."""
-    mcp.run(transport=transport, host=host, port=port, path=path)
+    """Start the FastMCP server.  Blocks until the process exits.
+
+    Two endpoints are served on the same port:
+      • /ros2            — full tool set (all 54 tools)
+      • /ros2-readonly   — sensor / status tools only (no actuation)
+    """
+    import contextlib
+    import uvicorn
+
+    readonly_path = path.rstrip("/") + "-readonly"   # e.g. /ros2-readonly
+
+    # Build ASGI sub-apps (each has its own lifespan + route table)
+    app_full     = mcp.http_app(path=path, transport=transport)
+    app_readonly = mcp_readonly.http_app(path=readonly_path, transport=transport)
+
+    # Both FastMCP apps need their lifespan to run so that the internal
+    # StreamableHTTPSessionManager task-group is initialised.  We create
+    # a combined ASGI app that starts both lifespans and routes by path.
+    @contextlib.asynccontextmanager
+    async def _combined_lifespan(app):
+        async with contextlib.AsyncExitStack() as stack:
+            await stack.enter_async_context(app_full.router.lifespan_context(app))
+            await stack.enter_async_context(app_readonly.router.lifespan_context(app))
+            yield
+
+    # Simple ASGI dispatcher: route requests starting with /ros2-readonly
+    # to app_readonly, everything else (including /ros2 and /mcp_api) to app_full.
+    async def combined(scope, receive, send):
+        if scope["type"] == "lifespan":
+            # Delegate lifespan to a tiny Starlette wrapper so both sub-apps init
+            from starlette.applications import Starlette
+            ls = Starlette(lifespan=_combined_lifespan)
+            await ls(scope, receive, send)
+            return
+        req_path = scope.get("path", "")
+        if req_path.startswith(readonly_path):
+            await app_readonly(scope, receive, send)
+        else:
+            await app_full(scope, receive, send)
+
+    logger.info("Serving full endpoint at %s  (%d tools)", path,
+                len(READONLY_TOOLS) + 1)  # approximate
+    logger.info("Serving read-only endpoint at %s  (%d tools)",
+                readonly_path, len(READONLY_TOOLS))
+
+    config = uvicorn.Config(
+        combined,
+        host=host,
+        port=port,
+        log_level="info",
+        timeout_graceful_shutdown=0,
+        lifespan="on",
+    )
+    server = uvicorn.Server(config)
+    import anyio
+    anyio.run(server.serve)
